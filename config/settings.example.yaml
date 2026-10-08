@@ -1,0 +1,82 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# 这是**模板**，不是程序实际读取的文件。
+#
+# 程序读的是同目录下的 `settings.yaml`：
+#   · 首次启动时由 `ensure_default_config()` 自动生成
+#   · 界面上「浏览…」选的程序路径、profile 目录，也会写回那一份
+#   · `settings.yaml` **不进版本库**（每台机器的路径都不一样）
+#
+# 想手改配置：把本文件复制成 `settings.yaml` 再改；或者直接在界面上改
+# （路径与 profile 支持界面修改，其余项改这里）。
+#
+# ⚠️ `client_path` / `browser.exe_path` 默认**留空**是刻意的：安装位置是机器特有的，
+#    猜一个错路径比空着更坏（空着程序会明确提示"还没设置路径"）。
+#    首次启动请在界面上点「浏览…」选一次，会自动记住。
+# ⚠️ `browser.user_data_dir`（浏览器 profile）里存着 bgm.tv 的登录态。
+#    换浏览器时界面会按家族换成对应目录（Chrome → browser-profile、
+#    Edge → browser-profile-edge …）；换目录就要重新登录一次 bgm.tv。
+# ─────────────────────────────────────────────────────────────────────────────
+
+netease:
+  client_path: ''
+  debug_port: 9222
+  rate_limit_rps: 1.0
+  playlist_name_template: '{yy}年{m}月'
+
+browser:
+  exe_path: ''
+  debug_port: 9223
+  user_data_dir: '%LOCALAPPDATA%\AniMusicCollector\browser-profile'
+  start_url: https://bgm.tv/
+
+bangumi:
+  uid: null
+  collection_type: 3
+  read_paths:
+  - api_tab
+  - dom
+  page_size: 100
+  only_target_season: true
+  include_cross_season: true
+
+fetch:
+  source_priority:
+  - bangumi
+  - animethemes
+  - anilist
+  animethemes_cache_ttl: 3600.0
+  # 日文维基响应的磁盘缓存（秒）。维基限速 1 请求/秒，一部番要试好几种词条名，
+  # 不开缓存时重复拉取要几分钟；0 = 不缓存（调试用）。
+  wikipedia_cache_ttl: 86400.0
+  # AniList（番单桥接用的辅助源，不给曲目）响应缓存（秒）。
+  # 它每次跑固定 2 次请求，一季的番单一天里基本不动 —— 缓存 1 小时；
+  # 0 = 不缓存（调试用）。
+  anilist_cache_ttl: 3600.0
+  # 外部数据源（日文维基 / AnimeThemes / AniList）的单次请求超时与重试次数。
+  # 默认 15 秒 / 2 次（总尝试 3 次）。这一档管的是「网络抖动」。
+  # 梯子稳：可以调到 30 / 4；梯子差：反过来调小，宁可早点认输。
+  http_timeout: 15.0
+  http_retries: 2
+  # 单次请求超过这个秒数就在日志里记一条「慢请求」；0 = 不记。
+  slow_request_seconds: 3.0
+  # —— HTTP 429（被限流）的策略，与上面那档**分开** ——
+  # 429 是服务端在限流，它会用 Retry-After 明说要等多久（实测拿到过 25 秒），
+  # 所以它不能跟网络抖动共用那套 0.5/1 秒的退避。
+  # **本步为限流等待的总预算（秒）**：用完就不再等，遇到 429 直接放弃该请求。
+  # 为什么是「总预算」而不是「单次上限」：限流常常和成功交替出现，成功会把
+  # 连续计数清零，于是熔断不触发、每条失败的 URL 都老实等 25 秒 —— 那会比
+  # 原来还慢好几倍。30 秒够扛过一次完整的 Retry-After=25。
+  rate_limit_wait_budget: 30.0
+  # 同一个 URL 为 429 最多等几次重试。
+  rate_limit_retries: 1
+  # 同一域名连续这么多次 429 就熔断：本步不再向它发请求。
+  # （一次「找不到词条」的番要试 7~13 个候选名，不熔断就会全撞一遍。）
+  rate_limit_breaker: 5
+
+match:
+  auto_threshold: 0.8
+  review_threshold: 0.6
+  max_queries_per_theme: 4
+  early_accept_score: 0.95
+  prefer_full_size: true
+  search_limit: 15

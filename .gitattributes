@@ -1,0 +1,32 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# 换行策略：**仓库里永远是 LF**，不依赖各台机器的 core.autocrlf
+#
+# 为什么需要这个文件（踩过的坑）：
+#   建库时工作区里有 11 个文件是 CRLF、而索引是 LF（`git ls-files --eol` 显示
+#   `i/lf w/crlf`）。起因是两处**我自己的**写法在 Windows 上会翻译换行：
+#     · Python 的 `Path.write_text()` —— `\n` 会被写成 `os.linesep`(CRLF)
+#     · PowerShell 的 `[IO.File]::WriteAllLines()` —— 用 `Environment.NewLine`
+#   `core.autocrlf` 是按机器配的**全局**设置，靠它等于把「文件里存什么字节」
+#   交给每台机器的配置决定：一旦某台机器是 `false`，编辑并提交就会把 LF 翻成
+#   CRLF，产生「整文件都改了」的假 diff —— 而那种 diff 看起来像重写了文件，
+#   会把真正的改动埋掉。
+#
+#   写成 .gitattributes 之后这条策略**跟着仓库走**，克隆到哪台机器都一样。
+#
+# eol=lf：检出到工作区也用 LF。Python 两种换行都吃，但只有一致才不会出假 diff。
+# 相关：HANDOFF.md 里记了这次规整的来龙去脉。
+# ─────────────────────────────────────────────────────────────────────────────
+
+* text=auto eol=lf
+
+# 二进制文件别让 git 当文本处理（否则它可能去"转换"换行，直接损坏文件）
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.db   binary
+*.dll  binary
+*.pyd  binary
+*.so   binary
+*.exe  binary
