@@ -24,11 +24,6 @@ reports/
 # 临时与备份（含 .tmp/subagent_changes_backup/ 那份改动留底）
 .tmp/
 
-# ── 用户交来的 bug 报告（截图 + 文字，如 bug/bug.txt）
-# 是**输入**不是代码；里面的现象与根因已经逐条写进 DESIGN.md 附录 G.16，
-# 截图本身没必要进版本库。想留档就把它从这一行里去掉再 add。
-bug/
-
 # 用户学出来的别名表：随使用变化，不是代码。
 config/aliases.yaml
 
@@ -36,29 +31,15 @@ config/aliases.yaml
 # 用户真机反馈时定的：settings.yaml 里存的是**这台机器特有**的东西 ——
 # 浏览器/网易云客户端的安装路径、profile 目录。界面上「浏览…」选完会写回它，
 # 进版本库只会让每次选路径都把仓库弄脏。模板走 config/settings.example.yaml。
-# （DESIGN.md §4 与附录里的目录清单本来就把 settings.yaml 标为"本地、不进库"，
+# （ai doc/项目说明/DESIGN.md §4 与附录里的目录清单本来就把 settings.yaml 标为"本地、不进库"，
 #   之前这行注释写反了，2026-10-07 纠正。）
 # ⚠️ 程序首次启动会自动生成它（ensure_default_config），所以删掉这份也没事。
 config/settings.yaml
 
-# ── 施工过程文档（**不跟踪**）
-# 用户 2026-10-07 的决定：版本库里只留「程序 + 使用说明 + 合规署名」，
-# 施工过程的东西留在本地磁盘。理由：
-#   · DESIGN.md / HANDOFF.md 是**过程记录**：里面有实测账号 UID、本机路径、
-#     逐轮排查的中间结论与自我更正 —— 属于开发笔记，不是产品的一部分
-#   · AGENTS.md 是给编码代理的工作规则，同样只服务于施工过程
-#   · docs/acc_2025Q2.txt、docs/measure_seasons.txt 是**原始实测输出**（可重跑出来）
-# ⚠️ 这些文件**仍在磁盘上**（`git rm --cached` 不删文件），但**不再有版本历史** ——
-#    改它们之前先自己留底，没有 `git checkout` 能救回来。
-#    （备份示例：.tmp/untracked_docs_backup_<时间戳>/，2026-10-07 那份就在）
-DESIGN.md
-HANDOFF.md
+# ── ai相关的文档（**不跟踪**）
+ai doc/
 AGENTS.md
-# 四轮改动的一页索引（2026-10-07 加）：与上面三份同类，是过程记录 ——
-# 内容全部来自代码/提交与实测，随时能重新整理一份出来。
-SUMMARY.md
-docs/acc_2025Q2.txt
-docs/measure_seasons.txt
+
 
 # ── Python
 __pycache__/
@@ -88,12 +69,4 @@ desktop.ini
 *.db
 *.db-wal
 *.db-shm
-
-# ⚠️ 注意：`data/` 被整体排除，其中包括 `data/mock/`。
-#    那几个 mock json 由 `python tools/fetch_mock_data.py` 生成，只服务于
-#    `tools/screenshot_ui.py` / `tools/demo_env.py` 这两个演示工具 ——
-#    主程序与单元测试都不依赖它。克隆下来要跑演示，先执行上面那条命令。
-docs/会话交接_2026-10-25.md
-docs/离线问题跟进_2026-10-25.md
-docs/权限修复进度跟踪_2026-10-25.md
-docs/修复与验证交接_2026-10-24.md
+tests/test_build_tool.py

@@ -199,7 +199,7 @@ def cmd_selfcheck(args) -> int:
         崩的是真正查词典那一刻。rapidfuzz 同理（靠 `rapidfuzz.libs` 兄弟目录里的 DLL）。
 
     所以这里每一节都**真的用一遍**：建词典 → 算相似度 → 构造一次 Qt 窗口。
-    输出用固定的 `selfcheck:` 前缀，构建脚本按「退出码 0 + 出现『全部通过』」断言。
+    输出用固定的 `selfcheck:` 前缀；依赖通过与运行环境警告分开报告。
     """
     from . import constants as C
 
@@ -261,7 +261,7 @@ def cmd_selfcheck(args) -> int:
     # 崩在创建 QApplication 或第一次画窗口那一刻。
     out("  [bold]Qt 界面（offscreen 构造一次）[/bold]")
     try:
-        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")   # 绝不弹窗（§2）
+        os.environ["QT_QPA_PLATFORM"] = "offscreen"   # 自检必须覆盖继承的平台设置
         from PySide6.QtWidgets import QApplication
         import PySide6
 
@@ -339,7 +339,11 @@ def cmd_selfcheck(args) -> int:
             out(f"  ✗ {f}", "red")
         out("selfcheck: 失败", "red")
         return 1
-    out("selfcheck: 全部通过")
+    out("selfcheck: 依赖自检通过")
+    if blocked or tf.get("错误") or C.low_integrity_warning(tf):
+        out("selfcheck: 运行环境有警告，尚未完成真机验收", "yellow")
+    else:
+        out("selfcheck: 已检查目录未发现写入阻塞；真机验收待进行")
     return 0
 
 
@@ -863,7 +867,8 @@ def main(argv: list[str] | None = None) -> int:
         # 首次运行时落一份 settings.yaml，方便用户改
         from .config import ensure_default_config
 
-        ensure_default_config()
+        if args.func is not cmd_selfcheck:
+            ensure_default_config()
     except Exception:  # noqa: BLE001
         pass
     try:

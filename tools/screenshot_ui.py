@@ -9,7 +9,7 @@ r"""把向导四步各渲染成 PNG，用于自查 UI 效果。
     python tools/screenshot_ui.py --rebuild       # 重建并重跑匹配（约 1~2 分钟）
     python tools/screenshot_ui.py --no-match      # 只拉番单不跑匹配
 
-输出到 docs/ui/
+输出到 ai doc/界面验收/ui/
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ from demo_env import make_env  # noqa: E402
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
-OUT = os.path.join(_ROOT, "docs", "ui")
+OUT = os.path.join(_ROOT, "ai doc", "界面验收", "ui")
 NAMES = ["step1_anime", "step2_theme", "step3_match", "step4_push"]
 
 

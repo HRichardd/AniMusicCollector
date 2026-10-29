@@ -4,7 +4,7 @@
     python tools/build_exe.py --no-tests      # 跳过测试（只在自己已经跑过时用）
     python tools/build_exe.py --zip           # 额外产出可直接搬走的 zip
 
-产物：`dist/AniMusicCollector/`，两个 exe 平级、共用同一份依赖：
+产物：`dist/<时间戳-唯一编号>/AniMusicCollector/`，保留旧产物和用户数据：
 
     AniMusicCollector.exe   窗口版（双击即用，无黑框）
     animusic.exe            控制台版（selfcheck / fetch / match / push / export）
@@ -19,11 +19,16 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import time
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -37,6 +42,29 @@ APP_DIR = DIST / "AniMusicCollector"
 #: `config/settings.yaml`（那是用户第一次运行时才该出现的东西）
 SMOKE_HOME = ROOT / ".tmp" / "exe-smoke-home"
 LOG_DIR = ROOT / ".tmp"
+
+
+def configure_run() -> None:
+    """每次构建独占目录，旧版用户数据和失败现场都不清理。"""
+    global DIST, BUILD, APP_DIR, SMOKE_HOME, LOG_DIR
+    run_id = datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8]
+    DIST = ROOT / "dist" / run_id
+    LOG_DIR = ROOT / ".tmp" / ("build-exe-" + run_id)
+    BUILD = LOG_DIR / "work"
+    SMOKE_HOME = LOG_DIR / "smoke-home"
+    APP_DIR = DIST / "AniMusicCollector"
+
+
+def isolated_env(home: Path, *, source: bool = False) -> dict:
+    env = dict(os.environ)
+    env.pop("PYTHONPATH", None)
+    env.pop("PYTHONHOME", None)
+    env.update(ANIMUSIC_HOME=str(home), ANIMUSIC_CONFIG_DIR=str(home / "config"),
+               QT_QPA_PLATFORM="offscreen", PYTHONIOENCODING="utf-8")
+    if source:
+        env["PYTHONPATH"] = os.pathsep.join([str(SRC), str(VENDOR)])
+        env["ANIMUSIC_BUILD_ROOT"] = str(ROOT)
+    return env
 
 
 def say(msg: str = "") -> None:
@@ -148,27 +176,12 @@ def step_tests(env: dict) -> None:
 
 
 def step_clean() -> None:
-    head("② 清理旧的构建产物")
-    for d in (BUILD, DIST):
-        if not d.exists():
-            say(f"  （没有 {d}）")
-            continue
-        try:
-            shutil.rmtree(d)
-            say(f"  已删除 {d}")
-        except OSError as e:
-            # 实测踩过：**由本程序启动的 Chrome 还在跑**时，它的 stdout/stderr 被接到
-            # `dist/.../logs/launch-浏览器.log` 上 ⇒ 那个文件被占用 ⇒ 整个目录删不掉
-            # （Windows 不允许删/改名"含未共享删除句柄文件"的目录）。
-            # 这里必须说人话，因为报错本身只是 `WinError 32`。
-            say(f"  ✗ 删不掉 {d}：{e}")
-            say(f"    占用者：{APP_DIR / 'logs'} 下的子进程日志 —— "
-                "由**本程序启动**的 Chrome / 网易云客户端还开着。")
-            say("    解决：先退出那两个程序（Chrome 那个窗口 / 网易云托盘），再构建。")
-            raise SystemExit(1)
-    # 自检用的 home 也要干净 —— 否则上一次的 settings.yaml 会让"首次运行"这件事失真
-    if SMOKE_HOME.exists():
-        shutil.rmtree(SMOKE_HOME, ignore_errors=True)
+    head("② 准备独立构建目录（保留旧产物及数据）")
+    for d in (BUILD, DIST, SMOKE_HOME):
+        if d.exists():
+            raise SystemExit(f"拒绝复用已有目录：{d.resolve()}")
+        d.mkdir(parents=True)
+        say(f"  新建 {d.resolve()}")
 
 
 def step_build(env: dict) -> None:
@@ -200,6 +213,7 @@ def step_smoke() -> None:
     证明不了词典/DLL 那些数据文件到位了。
     """
     head("④ 产物验收（跑的是 dist 里的 exe，不是源码）")
+    SMOKE_HOME.mkdir(parents=True, exist_ok=True)
     exe_cli = APP_DIR / "animusic.exe"
     exe_gui = APP_DIR / "AniMusicCollector.exe"
     for f in (exe_cli, exe_gui):
@@ -209,15 +223,13 @@ def step_smoke() -> None:
 
     # ⚠️ 故意**不给 PYTHONPATH**：打包产物必须自带依赖。
     #    留着它，产物偷偷从源码树 import 也会"通过"，把漏打的文件全掩盖掉。
-    smoke_env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
-    smoke_env["ANIMUSIC_HOME"] = str(SMOKE_HOME)
-    smoke_env["PYTHONIOENCODING"] = "utf-8"
+    smoke_env = isolated_env(SMOKE_HOME)
 
     # (1) 控制台版：离线自检（词典 / DLL / 路径 / Qt 构造）
     rc, text = run_logged([str(exe_cli), "selfcheck"],
                           LOG_DIR / "build_exe_selfcheck.log", env=smoke_env)
     say(tail(text, 18))
-    if rc != 0 or "全部通过" not in text:
+    if rc != 0 or "selfcheck: 依赖自检通过" not in text:
         say(f"✗ 产物自检没过（退出码 {rc}）—— 这就是「打包成功但用不了」的样子。")
         say(f"  完整输出：{LOG_DIR / 'build_exe_selfcheck.log'}")
         raise SystemExit(1)
@@ -228,7 +240,7 @@ def step_smoke() -> None:
     rc, text = run_logged([str(exe_cli), "selfcheck"],
                           LOG_DIR / "build_exe_selfcheck_cwd.log",
                           env=smoke_env, cwd=APP_DIR)
-    if rc != 0 or "全部通过" not in text:
+    if rc != 0 or "selfcheck: 依赖自检通过" not in text:
         say(tail(text, 18))
         say(f"✗ 从产物目录启动就失败了（退出码 {rc}）—— 说明它依赖构建目录")
         raise SystemExit(1)
@@ -325,7 +337,53 @@ def step_readme() -> None:
     say(f"✓ {out}（引用 sources/wikipedia.py 的 ATTRIBUTION，没有抄第二份）")
 
 
-def step_label_check() -> None:
+def read_integrity_label(path: Path) -> int | None:
+    """用 Windows API 读取强制标签，避免依赖 icacls 的本地化输出。"""
+    import ctypes as ct
+    from ctypes import wintypes as wt
+
+    api = ct.WinDLL("advapi32", use_last_error=True)
+    kernel = ct.WinDLL("kernel32", use_last_error=True)
+    get = api.GetNamedSecurityInfoW
+    get.argtypes = [wt.LPWSTR, wt.DWORD, wt.DWORD] + [ct.POINTER(ct.c_void_p)] * 5
+    get.restype = wt.DWORD
+    convert = api.ConvertSecurityDescriptorToStringSecurityDescriptorW
+    convert.argtypes = [ct.c_void_p, wt.DWORD, wt.DWORD,
+                        ct.POINTER(ct.c_void_p), ct.POINTER(wt.DWORD)]
+    convert.restype = wt.BOOL
+    kernel.LocalFree.argtypes = [ct.c_void_p]
+    kernel.LocalFree.restype = ct.c_void_p
+    descriptor, output = ct.c_void_p(), ct.c_void_p()
+    rc = get(str(path), 1, 0x10, None, None, None, None, ct.byref(descriptor))
+    if rc:
+        raise OSError(rc, f"读取强制标签失败：{path}")
+    try:
+        if not convert(descriptor, 1, 0x10, ct.byref(output), None):
+            raise ct.WinError(ct.get_last_error())
+        sddl = ct.wstring_at(output)
+        labels = re.findall(r"\(ML;[^)]*;;;([^;)]+)\)", sddl)
+        if not labels:
+            if "(ML;" in sddl:
+                raise ValueError(f"无法识别强制标签：{sddl}")
+            return None
+        known = {"UN": 0, "LW": 4096, "ME": 8192, "MP": 8448,
+                 "HI": 12288, "SI": 16384}
+        values = []
+        for sid in labels:
+            if sid in known:
+                values.append(known[sid])
+            elif sid.startswith("S-1-16-"):
+                values.append(int(sid.rsplit("-", 1)[1]))
+            else:
+                raise ValueError(f"未知完整性 SID：{sid}")
+        return min(values)
+    finally:
+        if output:
+            kernel.LocalFree(output)
+        kernel.LocalFree(descriptor)
+
+
+def step_label_check() -> list[dict]:
     """产物的**完整性标签**检查 —— 一次真机排查换来的检查项。
 
     实测踩过：工作区 `D:\\...\\AniMusicCollector` 带着
@@ -334,36 +392,61 @@ def step_label_check() -> None:
     `%LOCALAPPDATA%`（网易云没托盘图标、没登录态），而手工在终端里跑同一个命令
     却正常（启动的是无标签的 exe）、源码版也正常（启动的是无标签的 python.exe）。
 
-    这里在构建结束时**主动查一次**：带了低标签就说清楚后果与搬运办法 ——
-    比让人对着一个"残缺的客户端"猜便宜太多。
+    构建结束读取目录和两个 exe 的标签；低标签或无法读取都阻止交付。
+    文件标签不能证明启动上下文正常，实际进程令牌仍须真机确认。
     """
     head("⑥ 产物完整性标签")
-    try:
-        r = subprocess.run(["icacls", str(APP_DIR)], capture_output=True, text=True,
-                           errors="replace")
-        label = [ln.strip() for ln in (r.stdout or "").splitlines()
-                 if "Mandatory Label" in ln]
-    except Exception as e:  # noqa: BLE001
-        say(f"  （查不了标签：{type(e).__name__}: {e}）")
-        return
-    if not label:
-        say("  无强制标签（正常）—— 双击启动的进程会是中完整性，外部程序不会受影响")
-        return
-    say(f"  ⚠️ {APP_DIR} 带强制标签：{label[0]}")
-    if "Low" in label[0]:
-        say("     低完整性的 exe 双击后会以低完整性运行，它拉起的 Chrome / 网易云")
-        say("     也写不了 %LOCALAPPDATA%（网易云会没托盘图标、没登录态）。")
-        # ⚠️ 别建议"拷到旁边那个 -绿色版"：标签是 (OI)(CI) **继承**的，
-        #    在工作区里新建的目录照样带标签。必须指到标签树之外。
-        sys.path.insert(0, str(SRC))
+    results = []
+    failed = False
+    for path in (APP_DIR, APP_DIR / "animusic.exe", APP_DIR / "AniMusicCollector.exe"):
         try:
-            from animusic.constants import suggested_home
-        except Exception:  # noqa: BLE001
-            suggested = os.path.join(os.path.expanduser("~"), "Apps", "AniMusicCollector")
-        else:
-            suggested = suggested_home()
-        say(f"     解决办法：把整个文件夹拷到普通位置再双击，例如 {suggested}\\")
-        say("     （标签是目录级且可继承的，拷出去就不带了；以管理员运行只是碰巧绕过。）")
+            rid = read_integrity_label(path)
+            status = "通过" if rid is None or rid >= 8192 else "失败"
+            results.append({"path": path.name, "rid": rid, "status": status})
+            say(f"  {path.name}: {status}（标签 RID={rid}）")
+            failed |= status != "通过"
+        except Exception as e:
+            failed = True
+            results.append({"path": path.name, "status": "无法检查", "error": str(e)})
+            say(f"  {path.name}: 无法检查（{e}）")
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    (LOG_DIR / "integrity.json").write_text(
+        json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
+    if failed:
+        raise SystemExit("完整性标签检查未通过，停止交付；未修改系统权限。")
+    say("  仅验证文件标签；双击启动的实际进程令牌和外部程序行为仍需真机验收。")
+    return results
+
+
+def file_hash(path: Path) -> str:
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def source_hashes() -> dict[str, str]:
+    paths = [SPEC, ROOT / "run_cli.py", ROOT / "run_gui.py", Path(__file__)]
+    paths.extend(SRC.rglob("*.py"))
+    return {p.relative_to(ROOT).as_posix(): file_hash(p) for p in sorted(paths)}
+
+
+def step_manifest(info: dict, sources: dict, tests_run: bool, labels: list) -> None:
+    if sources != source_hashes():
+        raise SystemExit("构建期间源码发生变化，请重新构建，避免清单与产物不一致。")
+    dependencies = {}
+    for metadata in sorted(VENDOR.glob("*.dist-info/METADATA")):
+        from email.parser import Parser
+        parsed = Parser().parsestr(metadata.read_text(encoding="utf-8"))
+        dependencies[parsed["Name"]] = parsed["Version"]
+    manifest = {"built_at_utc": datetime.now(timezone.utc).isoformat(),
+                "tools": info, "dependencies": dependencies, "sources_sha256": sources,
+                "tests": "passed" if tests_run else "skipped",
+                "offline_smoke": "dependencies_passed", "integrity": labels,
+                "environment_details": "see build_exe_selfcheck.log in log_directory",
+                "log_directory": str(LOG_DIR),
+                "real_machine_acceptance": "pending",
+                "exe_sha256": {p.name: file_hash(p) for p in APP_DIR.glob("*.exe")}}
+    (APP_DIR / "build-manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def step_report(zip_it: bool) -> None:
@@ -417,15 +500,23 @@ def main() -> int:
                     help="不重新构建，只拿现有 dist 跑验收（改验收逻辑时省时间；"
                          "也可以拿它复验一个已经拷到别处的产物）")
     ap.add_argument("--zip", action="store_true", help="额外产出一个可分发的 zip")
+    ap.add_argument("--app-dir", type=Path, help="--skip-build 时指定已有产物目录（只读复验）")
     args = ap.parse_args()
+    if args.app_dir and not args.skip_build:
+        ap.error("--app-dir 只能与 --skip-build 一起使用")
+    if args.skip_build and args.zip:
+        ap.error("复验模式不打 zip，避免打入既有用户数据")
+
+    existing_app = args.app_dir.resolve() if args.app_dir else ROOT / "dist" / "AniMusicCollector"
+    configure_run()
+    global APP_DIR
+    if args.skip_build:
+        APP_DIR = existing_app
 
     info = preflight()
 
-    env = dict(os.environ)
-    env["ANIMUSIC_BUILD_ROOT"] = str(ROOT)          # spec 靠它定位仓库根
-    env["PYTHONPATH"] = os.pathsep.join([str(SRC), str(VENDOR)])
-    env["PYTHONIOENCODING"] = "utf-8"
-    env["QT_QPA_PLATFORM"] = "offscreen"            # 构建期不碰任何真实窗口
+    env = isolated_env(LOG_DIR / "test-home", source=True)
+    sources = source_hashes()
 
     if args.skip_build:
         if not APP_DIR.is_dir():
@@ -440,8 +531,10 @@ def main() -> int:
         step_clean()
         step_build(env)
     step_smoke()
-    step_readme()
-    step_label_check()
+    labels = step_label_check()
+    if not args.skip_build:
+        step_readme()
+        step_manifest(info, sources, not args.no_tests, labels)
     step_report(args.zip)
     say(f"（本次构建：Python {info['python']} / PyInstaller {info['pyinstaller']}）")
     return 0

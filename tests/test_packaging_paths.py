@@ -172,7 +172,7 @@ class TestSelfcheckCommand(unittest.TestCase):
 
     如果它自己坏了（例如抛异常、退出码不对、关键标记没打出来），
     那"构建脚本说打包成功"就一文不值。构建脚本的判据是
-    「退出码 0 + 输出里有『全部通过』」，这里就按同一个判据断言。
+    「退出码 0 + 输出里有『selfcheck: 依赖自检通过』」，不等同真机验收。
     """
 
     def test_selfcheck_exits_zero_with_marker(self):
@@ -189,7 +189,8 @@ class TestSelfcheckCommand(unittest.TestCase):
         text = buf.getvalue()
 
         self.assertEqual(code, 0, f"selfcheck 退出码 {code}：\n{text}")
-        self.assertIn("全部通过", text, f"没有打出验收标记：\n{text}")
+        self.assertIn("selfcheck: 依赖自检通过", text, f"没有打出验收标记：\n{text}")
+        self.assertNotIn("全部通过", text)
         # 同时确认它真的**用**了那两个最容易漏的依赖（而不是只 import）
         self.assertIn("pykakasi", text)
         self.assertIn("PySide6", text)
