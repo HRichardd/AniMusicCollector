@@ -93,3 +93,7 @@ desktop.ini
 #    那几个 mock json 由 `python tools/fetch_mock_data.py` 生成，只服务于
 #    `tools/screenshot_ui.py` / `tools/demo_env.py` 这两个演示工具 ——
 #    主程序与单元测试都不依赖它。克隆下来要跑演示，先执行上面那条命令。
+docs/会话交接_2026-10-25.md
+docs/离线问题跟进_2026-10-25.md
+docs/权限修复进度跟踪_2026-10-25.md
+docs/修复与验证交接_2026-10-24.md

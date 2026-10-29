@@ -423,7 +423,7 @@ class TestStepScopeLog(unittest.TestCase):
         self.db = os.path.join(self.home, "state.db")
         self.store = Store(self.db)
         self.sess = WizardSession(store=self.store, season=Season.parse("2026Q4"))
-        self.win = MainWindow(self.sess)
+        self.win = MainWindow(self.sess, probe_enabled=False)
         #: ⚠️ MainWindow 的 `log` 是**普通方法**（不是 EnvPanel 那种 Signal），
         #: 所以直接把它在这个实例上换成一个收集器即可。
         self.logs: list[str] = []

@@ -23,6 +23,8 @@ from ..models import (
     Origin,
     Season,
     SeasonBucket,
+    Stage,
+    StageStatus,
     Theme,
     ThemeKind,
     artists_from_json,
@@ -131,6 +133,15 @@ class WizardSession:
     def close(self) -> None:
         self.store.close()
 
+    def run_operation(self, operation: str, season: Season, *, progress=None, should_stop=None):
+        orch = self.orchestrator(progress=progress)
+        orch.should_stop = should_stop
+        try:
+            return getattr(orch, operation)(season)
+        finally:
+            # 取消的旧任务不能让之后的人工保存/别名学习也一直处于取消状态。
+            orch.should_stop = None
+
     @property
     def aliases(self):
         """别名表 —— 单一来源，直接从编排层取，避免两份实例各改各的。"""
@@ -198,6 +209,7 @@ class WizardSession:
             # 所以同时记下「这个值是回退来的」以及它的原始内容。
             display = cn or jp or romaji
             out.append({
+                "anime_id": r["id"],
                 "bgm_id": str(r["bgm_id"] or ""),
                 "animethemes_slug": r["animethemes_slug"] or "",
                 "title_cn": display,
@@ -245,6 +257,7 @@ class WizardSession:
             origin = Origin(r["origin"] or "animethemes")
             anime_on = anime_included.get(r["anime_id"], True)
             rows.append({
+                "theme_id": r["id"],
                 "anime": r["anime_cn"] or r["anime_jp"] or "?",
                 "anime_id": r["anime_id"],
                 "kind": r["kind"],
@@ -277,7 +290,8 @@ class WizardSession:
         # 第④步**上次保存过的选择**（勾选 + 逐行目标歌单）。
         # 不回读它的话：用户在最后一步逐行改好的歌单，任何一次 reload 都会
         # 被这里按季度名重建 —— 看起来「改了，下次打开又变回去了」。
-        selection = self.store.push_selection_map(sid)
+        saved_rows = self.store.push_selection_rows(sid)
+        selection = {(r["theme_id"], r["netease_song_id"]): r for r in saved_rows}
         # 已推送台账 —— 让步骤④ 一打开就能看到「哪些早就进歌单了」，
         # 而不是永远显示「待推送」让用户以为每次都要重推。
         # 按**该行自己的目标歌单**查（用户可以把某一行推到别的歌单，
@@ -334,7 +348,7 @@ class WizardSession:
 
             if chosen and status in ("auto", "confirmed"):
                 sid_ = chosen["netease_song_id"]
-                saved = selection.get(str(sid_)) or {}
+                saved = selection.get((tid, str(sid_))) or selection.get((None, str(sid_))) or {}
                 target = str(saved.get("playlist") or "").strip() or self.playlist_name
                 push_rows.append({
                     # 缺省是勾选（新歌、新季度）；用户取消过勾选的行记住为不勾
@@ -353,8 +367,8 @@ class WizardSession:
         push_rows.sort(key=lambda r: (r["anime"], r["kind"]))
         return match_rows, push_rows
 
-    @staticmethod
-    def _cand_dict(c: Any, rank: int) -> dict:
+    def _cand_dict(self, c: Any, rank: int) -> dict:
+        from ..scorer import classify
         alias = c["anime_alias"]
         try:
             tags = json.loads(c["tags"] or "[]")
@@ -377,110 +391,138 @@ class WizardSession:
             "score": c["score"] or 0.0,
             "detail": detail,
             "rank": c["search_rank"] if c["search_rank"] is not None else rank,
-            "status": "auto" if (c["score"] or 0) >= constants.AUTO_THRESHOLD
-                      else "pending_review" if (c["score"] or 0) >= constants.REVIEW_THRESHOLD
-                      else "low",
+            "status": classify(c["score"] or 0,
+                               auto_threshold=self.config.match.auto_threshold,
+                               review_threshold=self.config.match.review_threshold),
         }
 
     # ================================================================ 写：回存人工修改
 
     def save_anime(self, rows: list[dict]) -> None:
-        """把步骤① 的人工修改落库（含新增行的插入）。"""
+        """按数据库身份保存，页面上的名字不能成为更新主键。"""
         sid = self.season_id
+        existing_rows = {r["id"]: r for r in self.store.anime_list(sid, only_included=False)}
+        prepared = []
+        seen = set()
         for r in rows:
             cn = r.get("title_cn") or ""
-            # 回退显示值（日文名/罗马音）不能被当成真的中文名写库 ——
-            # 只有用户确实改过它，才认作是他填的中文名
             if r.get("_cn_auto") and cn == r.get("_cn_original"):
                 cn = ""
-            if not (cn or r.get("title_jp")):
-                continue
-            existing = None
-            if r.get("animethemes_slug"):
-                existing = self.store.conn.execute(
-                    "SELECT id FROM anime WHERE season_id=? AND animethemes_slug=?",
-                    (sid, r["animethemes_slug"]),
-                ).fetchone()
-            if existing is None and r.get("bgm_id"):
-                existing = self.store.conn.execute(
-                    "SELECT id FROM anime WHERE season_id=? AND bgm_id=?",
-                    (sid, r["bgm_id"]),
-                ).fetchone()
-            if existing is None and not r.get("bgm_id") and not r.get("animethemes_slug"):
-                existing = self.store.conn.execute(
-                    "SELECT id FROM anime WHERE season_id=? AND title_cn=?",
-                    (sid, cn),
-                ).fetchone()
-
-            if existing:
-                aid = existing["id"]
-                # 人工改过的行标 manual，从此不被拉取覆盖（§8.3）
-                self.store.conn.execute(
-                    """UPDATE anime SET title_cn=?, title_jp=?, included=?, note=?,
-                       origin=CASE WHEN origin='manual' THEN 'manual' ELSE ? END
-                       WHERE id=?""",
-                    (cn or None, r.get("title_jp") or None,
-                     int(bool(r.get("included"))), r.get("note") or "",
-                     str(r.get("origin") or Origin.MANUAL), aid),
-                )
-            else:
-                self.store.upsert_anime(sid, Anime(
-                    season_key=self.season.key,
-                    title_cn=cn or None,
-                    title_jp=r.get("title_jp") or None,
-                    bgm_id=int(r["bgm_id"]) if str(r.get("bgm_id") or "").isdigit() else None,
-                    air_date=self._date(r.get("air_date")),
-                    season_bucket=SeasonBucket(r.get("bucket") or "unknown"),
-                    origin=Origin.MANUAL,
-                    included=bool(r.get("included", True)),
-                    note=r.get("note") or "",
-                ))
-        self.store.conn.commit()
+            aid = r.get("anime_id")
+            old = existing_rows.get(aid)
+            if aid is not None and (old is None or aid in seen):
+                raise ValueError("番剧 ID 不属于当前季度或在页面中重复")
+            if aid is not None:
+                seen.add(aid)
+            jp = r.get("title_jp") or ""
+            if not (cn or jp or (old and old["title_romaji"])):
+                raise ValueError("番剧名称不能为空")
+            raw_date = str(r.get("air_date") or "").strip()
+            air = date.fromisoformat(raw_date).isoformat() if raw_date else None
+            bucket = str(SeasonBucket(r.get("bucket") or "unknown"))
+            changed = old is None or any((old[k] or "") != (v or "") for k, v in
+                                        (("title_cn", cn), ("title_jp", jp), ("air_date", air)))
+            prepared.append((r, old, cn, jp, air, bucket, changed))
+        assigned = []
+        with self.store.transaction():
+            changed_page = False
+            for r, old, cn, jp, air, bucket, changed in prepared:
+                included = int(bool(r.get("included", True)))
+                note = r.get("note") or ""
+                if old is not None:
+                    aid = old["id"]
+                    self.store.conn.execute(
+                        "UPDATE anime SET title_cn=?, title_jp=?, air_date=?, included=?, note=?, origin=? WHERE id=?",
+                        (cn or None, jp or None, air, included, note,
+                         str(Origin.MANUAL) if changed else old["origin"], aid))
+                    changed_page |= changed or old["included"] != included
+                else:
+                    cur = self.store.conn.execute(
+                        "INSERT INTO anime(season_id,title_cn,title_jp,bgm_id,air_date,season_bucket,origin,included,note) "
+                        "VALUES(?,?,?,?,?,?,?,?,?)",
+                        (sid, cn or None, jp or None,
+                         int(r["bgm_id"]) if str(r.get("bgm_id") or "").isdigit() else None,
+                         air, bucket, str(Origin.MANUAL), included, note))
+                    aid = int(cur.lastrowid)
+                    changed_page = True
+                assigned.append((r, aid))
+            self.store.set_stage(sid, Stage.ANIME, StageStatus.CONFIRMED, confirmed=True)
+            if changed_page:
+                self.store.mark_downstream_dirty(sid, Stage.ANIME)
+        for r, aid in assigned:
+            r["anime_id"] = aid
 
     def save_themes(self, rows: list[dict]) -> None:
-        """步骤② 的人工修改：含新增曲目与删除。"""
+        """整页原子保存；缺席行不等于删除，排除必须由 included 明确表达。"""
         sid = self.season_id
-        anime_ids = {r["id"]: (r["title_cn"] or r["title_jp"])
+        anime_ids = {r["id"]: (r["title_cn"] or r["title_jp"] or r["title_romaji"])
                      for r in self.store.anime_list(sid, only_included=False)}
-        name_to_id = {v: k for k, v in anime_ids.items()}
-
-        keep_ids: set[int] = set()
+        existing_rows = {r["id"]: r for r in self.store.theme_list(sid, only_included=False)}
+        prepared = []
+        seen = set()
         for r in rows:
-            aid = r.get("anime_id") or name_to_id.get(r.get("anime") or "")
-            if not aid:
-                continue
+            tid = r.get("theme_id")
+            old = existing_rows.get(tid)
+            if tid is not None and (old is None or tid in seen):
+                raise ValueError("曲目 ID 不属于当前季度或在页面中重复")
+            if tid is not None:
+                seen.add(tid)
+            aid = r.get("anime_id")
+            if aid is None:
+                matches = [k for k, v in anime_ids.items() if v == r.get("anime")]
+                if len(matches) != 1:
+                    raise ValueError("请选择唯一的所属番剧")
+                aid = matches[0]
+            if aid not in anime_ids:
+                raise ValueError("所属番剧不在当前季度")
             title = (r.get("song_title") or "").strip()
+            if not title:
+                raise ValueError("曲名不能为空")
+            kind = str(ThemeKind(r.get("kind") or "OP"))
+            seq = int(r.get("seq") or 1)
+            if seq < 1:
+                raise ValueError("曲目序号必须为正整数")
             artists = r.get("artists") or []
             if isinstance(artists, str):
-                artists = [x for x in artists.replace("、", ",").split(",") if x.strip()]
-            existing = self.store.conn.execute(
-                "SELECT id, origin FROM theme WHERE anime_id=? AND kind=? AND song_title=?",
-                (aid, r.get("kind") or "OP", title),
-            ).fetchone()
-            if existing is None and not title:
-                continue
-            if existing:
-                keep_ids.add(existing["id"])
-                self.store.conn.execute(
-                    "UPDATE theme SET artists=?, sequence=?, included=?, note=? WHERE id=?",
-                    (artists_to_json(artists), r.get("seq") or 1,
-                     int(bool(r.get("included", True))), r.get("note") or "",
-                     existing["id"]),
-                )
-            else:
-                tid = self.store.upsert_theme(aid, Theme(
-                    anime_id=aid,
-                    kind=ThemeKind(r.get("kind") or "OP"),
-                    song_title=title,
-                    artists=artists,
-                    sequence=r.get("seq") or 1,
-                    source="manual",
-                    origin=Origin.MANUAL,
-                    included=bool(r.get("included", True)),
-                    note=r.get("note") or "",
-                ))
-                keep_ids.add(tid)
-        self.store.conn.commit()
+                artists = [x.strip() for x in artists.replace("、", ",").split(",") if x.strip()]
+            artist_json = artists_to_json(artists)
+            match_changed = old is None or (old["anime_id"], old["kind"], old["song_title"],
+                                           artists_from_json(old["artists"])) != (aid, kind, title, artists)
+            changed = match_changed or (old["sequence"] or 1) != seq
+            # 番剧排除造成的未勾选不能污染曲目本身的选择。
+            included = bool(r.get("included", True)) if r.get("anime_included", True) else bool(
+                r.get("theme_included", r.get("included", True)))
+            prepared.append((r, old, aid, title, kind, seq, artist_json, included, changed, match_changed))
+        assigned = []
+        with self.store.transaction():
+            changed_page = False
+            for r, old, aid, title, kind, seq, artists, included, changed, match_changed in prepared:
+                note = r.get("note") or ""
+                if old is not None:
+                    tid = old["id"]
+                    self.store.conn.execute(
+                        "UPDATE theme SET anime_id=?,kind=?,song_title=?,artists=?,sequence=?,included=?,note=?,origin=? WHERE id=?",
+                        (aid, kind, title, artists,
+                         old["sequence"] if (old["sequence"] or 1) == seq else seq,
+                         int(included), note, str(Origin.MANUAL) if changed else old["origin"], tid))
+                    if match_changed:
+                        self.store.conn.execute(
+                            "UPDATE decision SET status='pending_review',chosen_candidate_id=NULL,decided_by='auto',"
+                            "note='曲目内容已修改，请重新审核',decided_at=datetime('now') WHERE theme_id=?", (tid,))
+                    changed_page |= changed or bool(old["included"]) != included
+                else:
+                    cur = self.store.conn.execute(
+                        "INSERT INTO theme(anime_id,kind,song_title,artists,sequence,included,note,source,origin) "
+                        "VALUES(?,?,?,?,?,?,?,?,?)",
+                        (aid, kind, title, artists, seq, int(included), note, "manual", "manual"))
+                    tid = int(cur.lastrowid)
+                    changed_page = True
+                assigned.append((r, tid, aid))
+            self.store.set_stage(sid, Stage.THEME, StageStatus.CONFIRMED, confirmed=True)
+            if changed_page:
+                self.store.mark_downstream_dirty(sid, Stage.THEME)
+        for r, tid, aid in assigned:
+            r["theme_id"], r["anime_id"] = tid, aid
 
     def save_decisions(self, rows: list[dict]) -> dict:
         """步骤③ 的人工确认落库，**并顺手学别名**。

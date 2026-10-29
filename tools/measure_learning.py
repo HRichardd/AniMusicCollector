@@ -112,7 +112,7 @@ def main() -> int:
             table.learn_anime([x for x in (t["anime_cn"], t["anime_jp"]) if x],
                               best["anime_alias"])
 
-    print(f"\n=== 2. 找出「其实已找对、只是分不够」的条目 ===")
+    print(f"\n=== 2. 按阈值推定可确认的条目（未经人工核验） ===")
     print(f"  判据: artist >= {CONFIRMABLE_ARTIST} 且 title >= {CONFIRMABLE_TITLE}")
     print(f"  命中 {len(confirmable)} / {len([r for r in rows if r[1]])} 条有候选的")
     print(f"  学到别名: {table.stats()}")

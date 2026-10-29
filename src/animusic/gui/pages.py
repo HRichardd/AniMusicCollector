@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QInputDialog,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -374,9 +375,11 @@ class ThemePage(BasePage):
         super().__init__(1, "② OP/ED 曲目确认", "来自 AnimeThemes", cols, parent)
         self.next_btn.setText("确认曲目，下一步 →")
         self.missing = missing
+        self.anime_choices: list[tuple[int, str]] = []
 
         self.model = DictTableModel(cols, rows)
         self.table = self.make_table(self.model)
+        self.table.add_handler = self._add
         self.add_widget(self.table)
 
         self.add_action("全选", lambda: self._set_all(True))
@@ -398,20 +401,33 @@ class ThemePage(BasePage):
         rows = self.visible_rows()
         for r in rows:
             r["included"] = v
+            if "theme_included" in r:
+                r["theme_included"] = v
         self._emit_all_changed()
         self.log.emit(f"全部{'收录' if v else '排除'}：当前显示 {len(rows)} 行{self._scope_hint()}")
 
     def _add(self) -> None:
+        if not self.anime_choices:
+            self.log.emit("请先到第①步纳入番剧，再新增曲目")
+            return
+        choices = [f"{name}（选项{i + 1}）" for i, (_aid, name) in enumerate(self.anime_choices)]
+        index = 0
+        if len(choices) > 1:
+            picked, ok = QInputDialog.getItem(self, "新增曲目", "所属番剧", choices, 0, False)
+            if not ok:
+                return
+            index = choices.index(picked)
+        aid, name = self.anime_choices[index]
         r = self.model.add_row(
             {
-                "included": True, "anime": "", "kind": "OP", "seq": 1,
+                "included": True, "anime": name, "anime_id": aid, "kind": "OP", "seq": 1,
                 "song_title": "", "artists": "", "origin": "manual",
                 "origin_label": "手工", "note": "",
             }
         )
         self.log.emit(f"新增第 {r + 1} 行 —— 请选择番剧并填写曲名")
         self.table.scrollToBottom()
-        self.table.edit(self.model.index(r, 1))
+        self.table.edit(self.model.index(r, 4))
         self._apply_filter(self._view, log=False)
 
     def _show_missing(self) -> None:
@@ -627,7 +643,6 @@ class MatchPage(BasePage):
                 w.deleteLater()
         self.cand_items = []
 
-        cands = row.get("candidates") or []
         if not row:
             # 空表（例如刚换季度、或还没跑匹配）—— 面板给个中性提示，
             # **不能直接取 row['anime']**，否则 KeyError 会把整个界面构造打断。
@@ -648,6 +663,7 @@ class MatchPage(BasePage):
             self.cand_layout.insertWidget(0, hint)
             return
 
+        cands = row.get("candidates") or []
         self.cand_title.setText(
             f"候选 —— {row.get('anime', '?')} · {row.get('kind', '')} · "
             f"{row.get('theme_title', '')}"
@@ -1071,6 +1087,7 @@ class MatchPage(BasePage):
 # ==================================================================== ④ 写入
 
 class PushPage(BasePage):
+    manual_requested = Signal()
     def __init__(self, rows: list[dict], parent=None):
         cols = [
             Column("included", "推送", 52, "check", align=Qt.AlignCenter),
@@ -1086,14 +1103,15 @@ class PushPage(BasePage):
 
         self.model = DictTableModel(cols, rows)
         self.table = self.make_table(self.model)
+        self.table.allow_add = False
         self.add_widget(self.table)
 
         self.add_action("全选", lambda: self._set_all(True))
-        self.add_action("+ 手动加歌", self._add)
+        self.add_action("返回③手动指定歌曲", self.manual_requested.emit)
 
         self.set_filter_spec({
             self.FILTER_ALL: None,
-            "待推送": lambda r: r.get("status") == "待推送",
+            "待推送": lambda r: r.get("status") in ("待推送", "未尝试"),
             "失败": lambda r: r.get("status") == "失败",
         })
         # 记住建表时的默认歌单名 —— 「目标歌单」输入框改动时，
@@ -1112,14 +1130,7 @@ class PushPage(BasePage):
             + ("" if v else "（取消勾选只表示这次不推，不会记为「已跳过」）"))
 
     def _add(self) -> None:
-        r = self.model.add_row(
-            {"included": True, "name": "", "artists": "", "netease_song_id": "",
-             "playlist": self._default_playlist, "status": "待推送"}
-        )
-        self.log.emit(f"新增第 {r + 1} 行")
-        self.table.scrollToBottom()
-        self.table.edit(self.model.index(r, 1))
-        self._apply_filter(self._view, log=False)
+        self.manual_requested.emit()
 
     # ---- ④ 与 MainWindow / session 之间的接口（推送只认这里的勾选）
 
@@ -1185,8 +1196,8 @@ class PushPage(BasePage):
                 r["included"] = bool(want[tid])
         self._emit_all_changed()
 
-    def mark_results(self, results: dict[str, str]) -> None:
-        """把推送结果写回表格（song_id → 状态）。
+    def mark_results(self, results: dict[str | tuple[str, str], str]) -> None:
+        """按（歌单、song_id）写回结果，兼容旧调用的单歌曲键。
 
         这里是**唯一**该改推送状态的地方：状态只能来自真实推送的返回值，
         页面自己不许编（早期原型在这里伪造过「成功」，那是很危险的行为 ——
@@ -1197,7 +1208,10 @@ class PushPage(BasePage):
         """
         for r in self.all_rows():
             sid = str(r.get("netease_song_id") or "")
-            if sid in results:
+            key = (str(r.get("playlist") or "").strip(), sid)
+            if key in results:
+                r["status"] = results[key]
+            elif sid in results:
                 r["status"] = results[sid]
         if self.model.rowCount():
             self.model.dataChanged.emit(
@@ -1209,7 +1223,7 @@ class PushPage(BasePage):
     def _refresh(self) -> None:
         # 全量口径：这些是事实（一共几首、几首失败），不该被筛选改变
         m = self.all_rows()
-        wait = len([r for r in m if r.get("status") == "待推送"])
+        wait = len([r for r in m if r.get("status") in ("待推送", "未尝试")])
         ok = len([r for r in m if r.get("status") == "已推送"])
         ex = len([r for r in m if r.get("status") == "已存在"])
         bad = len([r for r in m if r.get("status") == "失败"])

@@ -170,7 +170,7 @@ def external(exe: str, args: list[str], *, label: str = "", cwd: str | None = No
                 pass
 
 
-def wait_for_port(proc, port: int, timeout: float, *, on_waited=None) -> dict:
+def wait_for_port(proc, port: int, timeout: float, *, on_waited=None, should_stop=None) -> dict:
     """等调试端口，**不因为子进程退出就判失败**。
 
     实测（用户真机）：Chrome 的 `chrome.exe` 只是**交接用的桩** ——
@@ -184,6 +184,8 @@ def wait_for_port(proc, port: int, timeout: float, *, on_waited=None) -> dict:
     t0 = time.time()
     exited: int | None = None
     while time.time() - t0 < timeout:
+        if should_stop is not None and should_stop():
+            return {"ok": False, "cancelled": True, "msg": "已停止等待调试端口", "exit_code": exited}
         if _port_open(port):
             msg = f"已接管，端口 {port} 就绪（{time.time() - t0:.1f}s）"
             if exited is not None:

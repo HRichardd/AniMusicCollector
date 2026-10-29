@@ -11,9 +11,12 @@
 from __future__ import annotations
 
 import traceback
+import inspect
+from threading import Event
 from typing import Any, Callable
 
 from PySide6.QtCore import QThread, Signal
+from ..orchestrator import OperationCancelled
 
 
 class TaskWorker(QThread):
@@ -30,6 +33,7 @@ class TaskWorker(QThread):
     progressed = Signal(str)
     succeeded = Signal(object)
     failed = Signal(str, str)      # (简短错误, 详细堆栈)
+    cancelled = Signal(str)
 
     def __init__(self, fn: Callable[..., Any], *args, label: str = "", parent=None,
                  cleanup: Callable[[], Any] | None = None, **kwargs):
@@ -39,31 +43,47 @@ class TaskWorker(QThread):
         self.kwargs = kwargs
         self.label = label or getattr(fn, "__name__", "任务")
         self.cleanup = cleanup
+        self._stop_event = Event()
+
+    def request_stop(self) -> None:
+        self._stop_event.set()
+        self.requestInterruption()
+
+    def should_stop(self) -> bool:
+        return self._stop_event.is_set()
 
     def run(self) -> None:  # noqa: D102
+        terminal, payload = "succeeded", None
         try:
-            self._run_job()
+            payload = self._run_job()
+        except OperationCancelled as e:
+            terminal, payload = "cancelled", str(e)
+        except Exception as e:
+            terminal, payload = "failed", (f"{type(e).__name__}: {e}", traceback.format_exc())
         finally:
             if self.cleanup is not None:
                 try:
                     self.cleanup()
-                except Exception:  # noqa: BLE001 - 清理失败不能盖掉真正的任务结果
-                    pass
+                except Exception as e:
+                    if terminal == "succeeded":
+                        terminal, payload = "failed", (f"线程资源清理失败：{e}", traceback.format_exc())
+        # 先清理连接再报告结果；UI仍须等待finished才能解锁或销毁线程。
+        if terminal == "failed":
+            self.failed.emit(*payload)
+        elif terminal == "cancelled":
+            self.cancelled.emit(payload)
+        else:
+            self.succeeded.emit(payload)
 
-    def _run_job(self) -> None:
-        try:
-            result = self.fn(*self.args, progress=self.progressed.emit, **self.kwargs)
-        except TypeError as e:
-            # 该可调用对象不接受 progress 参数 —— 退回无参调用
-            if "progress" not in str(e):
-                self.failed.emit(f"{type(e).__name__}: {e}", traceback.format_exc())
-                return
-            try:
-                result = self.fn(*self.args, **self.kwargs)
-            except Exception as e2:  # noqa: BLE001
-                self.failed.emit(f"{type(e2).__name__}: {e2}", traceback.format_exc())
-                return
-        except Exception as e:  # noqa: BLE001 - 后台线程必须吞掉一切，否则界面无反馈
-            self.failed.emit(f"{type(e).__name__}: {e}", traceback.format_exc())
-            return
-        self.succeeded.emit(result)
+    def _run_job(self):
+        if self.should_stop():
+            raise OperationCancelled("任务开始前已停止")
+        parameters = inspect.signature(self.fn).parameters
+        variadic = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values())
+        kwargs = dict(self.kwargs)
+        for key, value in (("progress", self.progressed.emit), ("should_stop", self.should_stop)):
+            p = parameters.get(key)
+            if variadic or (p is not None and p.kind != inspect.Parameter.POSITIONAL_ONLY):
+                kwargs.setdefault(key, value)
+        # 不能在业务TypeError后重跑函数，第一次调用可能已产生写入。
+        return self.fn(*self.args, **kwargs)

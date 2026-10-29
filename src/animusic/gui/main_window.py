@@ -8,7 +8,7 @@ import socket
 import urllib.request
 from datetime import date
 
-from PySide6.QtCore import Qt, QThread, QTimer, Signal
+from PySide6.QtCore import Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
@@ -35,7 +35,7 @@ from PySide6.QtWidgets import (
 from .. import browsers, constants, spawn
 from ..config import Config
 from ..models import Season
-from ..orchestrator import PushItem, PushReport
+from ..orchestrator import PushReport
 from .session import WizardSession
 from .workers import TaskWorker
 from . import style
@@ -85,6 +85,8 @@ class ProbeWorker(QThread):
 
     def run(self) -> None:  # noqa: D102
         out: dict[str, tuple] = {}
+        if self.isInterruptionRequested():
+            return
 
         if _port_open(self.netease_port):
             ver = _http_json(self.netease_port, "/json/version")
@@ -92,6 +94,8 @@ class ProbeWorker(QThread):
         else:
             out["netease"] = (None, None)
 
+        if self.isInterruptionRequested():
+            return
         if _port_open(self.browser_port):
             ver = _http_json(self.browser_port, "/json/version")
             tabs = _http_json(self.browser_port, "/json/list") or []
@@ -131,6 +135,8 @@ class LaunchWorker(QThread):
         self.timeout = timeout
 
     def run(self) -> None:  # noqa: D102
+        if self.isInterruptionRequested():
+            return
         if _port_open(self.port):
             self.done.emit({"ok": True, "msg": f"端口 {self.port} 已在监听，直接复用"})
             return
@@ -149,14 +155,15 @@ class LaunchWorker(QThread):
         # 「进程启动后立即退出」，而浏览器其实起来了、端口一两秒后就开 ——
         # 用户看到的是一个假报错弹窗。现在退出只记下来，继续等端口。
         res = spawn.wait_for_port(
-            proc, self.port, self.timeout, on_waited=self.progress.emit
+            proc, self.port, self.timeout, on_waited=self.progress.emit,
+            should_stop=self.isInterruptionRequested
         )
         if res["ok"]:
             self.done.emit({"ok": True, "msg": res["msg"]})
             return
         self.done.emit({
             "ok": False,
-            "stage": "timeout" if res["exit_code"] is None else "exited",
+            "stage": "cancelled" if res.get("cancelled") else "timeout" if res["exit_code"] is None else "exited",
             "exit_code": res["exit_code"],
             "alive": res["exit_code"] is None,
             "port": self.port,
@@ -190,14 +197,6 @@ def _profile_from_config(cfg: Config | None) -> str:
     return browsers.derive_profile(_browser_exe(cfg))
 
 
-#: 写入动作常量（`"added"` = 真的写进去了）—— 延迟读取并缓存。
-#: 为什么不像别处那样在函数里 `from ... import`：`_push_group` 每首歌都会用到它，
-#: 而且导入 collector 会连带拉起 CDP 依赖；界面在拿不到它时也该能打开，
-#: 取不到就退回台账判断（次优但安全，与 orchestrator 的处理一致）。
-_WRITE_ACTION_ADDED: str | None = None
-_WRITE_ACTION_LOADED = False
-
-
 def wikipedia_attribution() -> str:
     """维基百科的 CC BY-SA 署名文本 —— **唯一来源**在 `sources/wikipedia.py`。
 
@@ -213,19 +212,6 @@ def wikipedia_attribution() -> str:
     from ..sources.wikipedia import ATTRIBUTION
 
     return ATTRIBUTION
-
-
-def _write_action_added() -> str | None:
-    global _WRITE_ACTION_ADDED, _WRITE_ACTION_LOADED
-    if not _WRITE_ACTION_LOADED:
-        _WRITE_ACTION_LOADED = True
-        try:
-            from ..collector.desktop_cdp import WRITE_ACTION_ADDED as WA
-
-            _WRITE_ACTION_ADDED = WA
-        except Exception:  # noqa: BLE001
-            _WRITE_ACTION_ADDED = None
-    return _WRITE_ACTION_ADDED
 
 
 def _combo_index_of(combo, target) -> int:
@@ -535,11 +521,12 @@ class EnvPanel(QFrame):
     #: 用户在下拉框里换了季度（携带是 Season 对象）
     season_changed = Signal(object)
 
-    def __init__(self, session: WizardSession, parent=None):
+    def __init__(self, session: WizardSession, parent=None, *, probe_enabled: bool = True):
         super().__init__(parent)
         #: 保存 session 引用：下面的 `_save_launcher_config` 要改 session.config
         #: （路径/profile 选完就落库 + 同步内存，后续行为与界面一致）
         self.session = session
+        self._probe_enabled = probe_enabled
         self.setObjectName("Card")
         root = QVBoxLayout(self)
         root.setContentsMargins(10, 8, 10, 8)
@@ -575,15 +562,16 @@ class EnvPanel(QFrame):
         root.addLayout(head)
 
         self.netease = TargetRow("网易云客户端", _netease_exe(session.config),
-                                 constants.NETEASE_DEBUG_PORT, "启动并接管")
+                                 session.config.netease.debug_port, "启动并接管")
         self.netease.launched.connect(self._launch_netease)
         self.netease.copy_requested.connect(self._copy_netease_cmd)
         self.netease.browse_requested.connect(lambda _l: self._pick_exe("netease"))
         self.netease.path_committed.connect(self._on_netease_path)
+        self.netease.port_edit.editingFinished.connect(lambda: self._on_port_edited("netease"))
         root.addWidget(self.netease)
 
         self.browser = TargetRow(
-            "浏览器", _browser_exe(session.config), constants.BROWSER_DEBUG_PORT,
+            "浏览器", _browser_exe(session.config), session.config.browser.debug_port,
             "启动并打开 Bangumi",
             # 用**独立标签**常驻显示；tooltip 里讲清哪些行、哪些不行
             hint="(需 Chromium 内核)",
@@ -595,6 +583,7 @@ class EnvPanel(QFrame):
         self.browser.copy_requested.connect(self._copy_browser_cmd)
         self.browser.browse_requested.connect(lambda _l: self._pick_exe("browser"))
         self.browser.path_committed.connect(self._on_browser_path)
+        self.browser.port_edit.editingFinished.connect(lambda: self._on_port_edited("browser"))
         self.browser.profile.dir_pick_requested.connect(self._pick_profile_dir)
         self.browser.profile.reset_requested.connect(self._reset_profile)
         self.browser.profile.dir_committed.connect(self._on_profile_edited)
@@ -717,26 +706,54 @@ class EnvPanel(QFrame):
 
             self.log.emit("      （换浏览器时不会再自动改这个目录；要恢复默认点「默认」）")
 
+    def _on_port_edited(self, kind: str) -> None:
+        row = self.netease if kind == "netease" else self.browser
+        section = getattr(self.session.config, kind)
+        text = row.port_edit.text().strip()
+        if not text:
+            row.port_edit.setText(str(section.debug_port))
+            return
+        try:
+            port = int(text)
+            if not 1 <= port <= 65535:
+                raise ValueError
+            other = "browser" if kind == "netease" else "netease"
+            if port == getattr(self.session.config, other).debug_port:
+                raise ValueError
+        except ValueError:
+            self.log.emit(f"{row.label}端口无效：请输入1—65535，且不能与另一程序相同。已恢复原值。")
+            row.port_edit.setText(str(section.debug_port))
+            return
+        row.port_edit.setText(str(port))
+        if port == section.debug_port:
+            return
+        self._save_launcher_config(**{kind + "_port": port}, log_what=row.label + "调试端口")
+        row.port = port
+        # 已构造的编排器带着旧端口的 BrowserBridge，后续任务必须重建它。
+        self.session._orch = None
+
     def _save_launcher_config(self, *, netease: str | None = None,
                               browser: str | None = None,
-                              profile: str | None = None, log_what: str = "") -> None:
-        """把路径/profile 写回 `settings.yaml`，并同步内存里的 session.config。
+                              profile: str | None = None,
+                              netease_port: int | None = None,
+                              browser_port: int | None = None, log_what: str = "") -> None:
+        """把路径/profile/端口写回配置，并同步内存。
 
         **先重读磁盘、再只改这几个 key**：用户在程序开着的时候手工改过 settings.yaml
         的其它项（阈值、歌单模板…）不能被我们整体覆盖掉。
         """
         cfg = self.session.config
-        if netease is not None:
-            cfg.netease.client_path = netease
-        if browser is not None:
-            cfg.browser.exe_path = browser
-        if profile is not None:
-            cfg.browser.user_data_dir = profile
+        changes = (("netease", "client_path", netease), ("browser", "exe_path", browser),
+                   ("browser", "user_data_dir", profile), ("netease", "debug_port", netease_port),
+                   ("browser", "debug_port", browser_port))
+        for section, key, value in changes:
+            if value is not None:
+                setattr(getattr(cfg, section), key, value)
         try:
-            fresh = Config.load()               # 重读磁盘（前面几行改的是内存那份）
-            fresh.netease.client_path = cfg.netease.client_path
-            fresh.browser.exe_path = cfg.browser.exe_path
-            fresh.browser.user_data_dir = cfg.browser.user_data_dir
+            fresh = Config.load(cfg.path or None)
+            for section, key, value in changes:
+                if value is not None:
+                    setattr(getattr(fresh, section), key, value)
             fresh.save()
         except Exception as e:  # noqa: BLE001
             # 写不进去（只读目录 / 受限环境）→ **如实说**，不假装保存成功
@@ -812,20 +829,24 @@ class EnvPanel(QFrame):
 
     # ---- 非阻塞探测
     def probe(self) -> None:
+        if not self._probe_enabled or getattr(self, "_closing", False):
+            return
         if self._worker is not None and self._worker.isRunning():
             return  # 不重入，避免线程堆积
         self.netease.set_status(style.TEXT_DIM, "检测中…")
         self.browser.set_status(style.TEXT_DIM, "检测中…")
 
         self._worker = ProbeWorker(
-            int(self.netease.port_edit.text() or constants.NETEASE_DEBUG_PORT),
-            int(self.browser.port_edit.text() or constants.BROWSER_DEBUG_PORT),
+            self.session.config.netease.debug_port,
+            self.session.config.browser.debug_port,
             self,
         )
         self._worker.done.connect(self._on_probe)
         self._worker.start()
 
     def _on_probe(self, res: dict) -> None:
+        if getattr(self, "_closing", False):
+            return
         browser_ver, _ = res.get("netease", (None, None))
         if browser_ver:
             self.netease.set_status(style.OK, f"已连接 ({browser_ver.split('/')[-1]})")
@@ -850,7 +871,8 @@ class EnvPanel(QFrame):
     # 同一份参数有三处，改一处不生效。
     def _netease_spec(self) -> tuple[str, list[str], int]:
         exe = self.netease.path_edit.text().strip()
-        port = int(self.netease.port_edit.text().strip() or constants.NETEASE_DEBUG_PORT)
+        self._on_port_edited("netease")
+        port = self.session.config.netease.debug_port
         return exe, [
             f"--remote-debugging-port={port}",
             "--disable-features=CalculateNativeWinOcclusion",
@@ -858,7 +880,8 @@ class EnvPanel(QFrame):
 
     def _browser_spec(self) -> tuple[str, list[str], int]:
         exe = self.browser.path_edit.text().strip()
-        port = int(self.browser.port_edit.text().strip() or constants.BROWSER_DEBUG_PORT)
+        self._on_port_edited("browser")
+        port = self.session.config.browser.debug_port
         # profile 取**界面字段**（可自行修改），不再是写死的常量；
         # 字段空着就按家族推导一个（不落盘，只为让"复制命令"仍然可用）。
         profile = ""
@@ -930,6 +953,8 @@ class EnvPanel(QFrame):
         )
 
     def _run_launch(self, label: str, row: "TargetRow", exe: str, args: list[str], port: int) -> None:
+        if getattr(self, "_closing", False):
+            return
         if getattr(self, "_launch_worker", None) is not None and self._launch_worker.isRunning():
             self.log.emit("已有启动任务在进行中，请等待完成")
             return
@@ -946,6 +971,8 @@ class EnvPanel(QFrame):
         self._launch_worker.start()
 
     def _on_launch_done(self, label: str, row: "TargetRow", command: str, res: dict) -> None:
+        if getattr(self, "_closing", False) or res.get("stage") == "cancelled":
+            return
         if res.get("ok"):
             self.log.emit(f"{label}：{res['msg']}")
             self.probe()
@@ -990,13 +1017,14 @@ class EnvPanel(QFrame):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, session: WizardSession):
+    def __init__(self, session: WizardSession, *, probe_enabled: bool = True):
         super().__init__()
         self.session = session
         self.data: dict[str, list[dict]] = {
             "anime": [], "theme": [], "match": [], "push": [], "missing_source": [],
         }
         self.worker: TaskWorker | None = None
+        self._closing = False
         self.setWindowTitle("AniMusicCollector —— 新番 OP/ED → 网易云歌单")
         self.resize(1500, 980)
 
@@ -1006,7 +1034,7 @@ class MainWindow(QMainWindow):
         root.setContentsMargins(12, 10, 12, 8)
         root.setSpacing(8)
 
-        self.env = EnvPanel(session)
+        self.env = EnvPanel(session, probe_enabled=probe_enabled)
         self.env.log.connect(self.log)
         root.addWidget(self.env)
 
@@ -1054,6 +1082,10 @@ class MainWindow(QMainWindow):
         self.btn_log.setToolTip("显示 / 隐藏日志面板（Ctrl+L）")
         self.btn_log.toggled.connect(self._set_log_visible)
         self.status.addWidget(self.btn_log)
+        self.btn_stop = QPushButton("停止任务")
+        self.btn_stop.setEnabled(False)
+        self.btn_stop.clicked.connect(self._stop_task)
+        self.status.addWidget(self.btn_stop)
         # 留住引用：见下面 QTimer 那段注释 —— 这个项目已经因为「匿名 QObject 交给 GC」
         # 吃过一次间歇性崩溃（0xC0000409）。QShortcut 没有定时器、风险低得多，
         # 但留着引用是免费的，而且下次读代码的人不会再来一遍这个推理。
@@ -1081,7 +1113,8 @@ class MainWindow(QMainWindow):
         # 并且实测见过整个进程被杀掉（退出码 0xC0000409，全量测试跑完不打汇总）。
         # 关窗口就该停掉它 —— 这本来也是对的：窗口都没了，不该再探测。
         self._timer = QTimer(self, timeout=self._tick, interval=PROBE_INTERVAL_MS)
-        self._timer.start()
+        if probe_enabled:
+            self._timer.start()
 
         self._goto(0)
         self._intro()
@@ -1117,10 +1150,17 @@ class MainWindow(QMainWindow):
         push.add_action("试运行", self._push_dry_run, "normal",
                          "只列出会推哪些歌，不写入", index=1)
         push.add_action("检查目标歌单", self._check_playlist, "normal", "", index=2)
-
-        # 环境面板的正经接线（原来这里是空的 —— 季度下拉框因此成了装饰品）
+        push.manual_requested.connect(self._manual_song_help)
         self.env.season_changed.connect(self._on_season_changed)
         self.env.playlist.textEdited.connect(self._on_playlist_edited)
+
+    def _manual_song_help(self) -> None:
+        if not self.pages[2].all_rows():
+            self._goto(1)
+            self.log("请先在第②步新增曲目，确认后到第③步手动指定网易云歌曲")
+        else:
+            self._goto(2)
+            self.log("请选择目标曲目，使用「手动指定」填写网易云歌曲ID；缺少曲目时先回②新增")
 
     # ---------------------------------------------------------------- 日志面板
     def _set_log_visible(self, on: bool) -> None:
@@ -1135,6 +1175,8 @@ class MainWindow(QMainWindow):
         这是之前缺的那条接线：下拉框和 `sess.season` 曾经是两个互不相干的
         变量，用户在界面上换季度等于什么都没发生。
         """
+        if self._closing or (self.worker is not None and self.worker.isRunning()):
+            return
         self.session.set_season(s)
         self.log(f"季度切换为 {s.key}（{s.label}）")
         # 「目标歌单」和表格都在 reload 里按新季度重建（含名字由季度推出，②）；
@@ -1186,6 +1228,9 @@ class MainWindow(QMainWindow):
         self.pages[0].set_data(self.data["anime"])
         self.pages[1].set_data(self.data["theme"])
         self.pages[1].missing = self.data["missing_source"]
+        self.pages[1].anime_choices = [(r["anime_id"], " · ".join(x for x in (
+            r["title_cn"], r["title_jp"] if r["title_jp"] != r["title_cn"] else "", r["air_date"]) if x))
+            for r in self.data["anime"] if r["included"]]
         self.pages[2].set_data(self.data["match"])
         push_page.set_data(self.data["push"])
         push_page.restore_included(want)
@@ -1202,12 +1247,17 @@ class MainWindow(QMainWindow):
 
     def _busy(self, on: bool, label: str = "") -> None:
         for p in self.pages:
-            p.next_btn.setEnabled(not on)
+            p.setEnabled(not on and not self._closing)
+        self.env.setEnabled(not on and not self._closing)
+        self.stepper.setEnabled(not on and not self._closing)
+        self.btn_stop.setEnabled(on and not self._closing)
         if on:
             self.status.showMessage(f"  ⏳ {label}…")
             self.log(f"▶ {label}（后台执行，界面不会卡）")
 
-    def _run_task(self, fn, label: str, on_done=None) -> None:
+    def _run_task(self, fn, label: str, on_done=None, *, refresh_on_success: bool = True) -> None:
+        if self._closing:
+            return
         if self.worker is not None and self.worker.isRunning():
             self.log(f"已有任务在跑，忽略本次「{label}」")
             return
@@ -1216,24 +1266,60 @@ class MainWindow(QMainWindow):
         # 关不掉别的线程建的连接（sqlite 的线程检查，实测确认）。
         w = TaskWorker(fn, label=label, parent=self,
                        cleanup=self.session.store.close_thread)
-        w.progressed.connect(lambda m: self.log(f"    {m}"))
-        w.failed.connect(lambda msg, tb: self._task_failed(label, msg, tb))
-        w.succeeded.connect(lambda res: self._task_done(label, res, on_done))
+        w._ui_done = on_done
+        w._ui_refresh = refresh_on_success
+        # QObject槽明确在主线程执行，不能让工作线程直接更新或销毁界面。
+        w.progressed.connect(self._task_progress)
+        w.failed.connect(self._worker_failed)
+        w.cancelled.connect(self.log)
+        w.succeeded.connect(self._worker_succeeded)
+        w.finished.connect(self._task_finished)
         self.worker = w
         w.start()
 
+    @Slot(str)
+    def _task_progress(self, message: str) -> None:
+        self.log(f"    {message}")
+
+    @Slot(str, str)
+    def _worker_failed(self, message: str, traceback_text: str) -> None:
+        self._task_failed(self.sender().label, message, traceback_text)
+
+    @Slot(object)
+    def _worker_succeeded(self, result) -> None:
+        worker = self.sender()
+        self._task_done(worker.label, result, worker._ui_done, refresh_on_success=worker._ui_refresh)
+
     def _task_failed(self, label: str, msg: str, tb: str) -> None:
-        self._busy(False)
         self.log(f"✗ {label} 失败：{msg}")
         self.logpane.log(tb.splitlines()[-1] if tb else "")
-        QMessageBox.warning(self, f"{label} 失败", msg)
+        if not self._closing:
+            QMessageBox.warning(self, f"{label} 失败", msg)
 
-    def _task_done(self, label: str, result, on_done) -> None:
-        self._busy(False)
+    def _task_done(self, label: str, result, on_done, *, refresh_on_success: bool = True) -> None:
         self.log(f"✓ {label} 完成")
         if on_done is not None:
             on_done(result)
-        self.reload(label)
+        if getattr(self, "_closing", False):
+            return
+        if refresh_on_success:
+            self.reload(label)
+        else:
+            self._update_status()
+
+    def _stop_task(self) -> None:
+        if self.worker is not None and self.worker.isRunning():
+            self.worker.request_stop()
+            self.btn_stop.setEnabled(False)
+            self.log("已请求停止，正在等待当前操作完成回查与记账")
+
+    @Slot()
+    def _task_finished(self, worker=None) -> None:
+        if worker is None:
+            worker = self.sender()
+        if worker is self.worker:
+            self._busy(False)
+        self._finish_close_when_ready()
 
     # ---- 具体动作
 
@@ -1241,8 +1327,8 @@ class MainWindow(QMainWindow):
         sess = self.session
         season = sess.season
 
-        def job(progress=None):
-            return sess.orchestrator(progress=progress).fetch_season(season)
+        def job(progress=None, should_stop=None):
+            return sess.run_operation('fetch_season', season, progress=progress, should_stop=should_stop)
 
         self._run_task(job, f"从 Bangumi 拉取 {season.key}")
 
@@ -1250,8 +1336,8 @@ class MainWindow(QMainWindow):
         sess = self.session
         season = sess.season
 
-        def job(progress=None):
-            return sess.orchestrator(progress=progress).fetch_season_from_animethemes(season)
+        def job(progress=None, should_stop=None):
+            return sess.run_operation('fetch_season_from_animethemes', season, progress=progress, should_stop=should_stop)
 
         self._run_task(job, f"从 AnimeThemes 拉取 {season.key}")
 
@@ -1264,8 +1350,8 @@ class MainWindow(QMainWindow):
         sess = self.session
         season = sess.season
 
-        def job(progress=None):
-            return sess.orchestrator(progress=progress).update_season(season)
+        def job(progress=None, should_stop=None):
+            return sess.run_operation('update_season', season, progress=progress, should_stop=should_stop)
 
         def done(rep):
             for line in sess.orchestrator().describe_update(rep):
@@ -1286,8 +1372,8 @@ class MainWindow(QMainWindow):
         sess = self.session
         season = sess.season
 
-        def job(progress=None):
-            return sess.orchestrator(progress=progress).refresh_themes(season)
+        def job(progress=None, should_stop=None):
+            return sess.run_operation('refresh_themes', season, progress=progress, should_stop=should_stop)
 
         self._run_task(job, f"更新曲目 {season.key}")
 
@@ -1318,149 +1404,52 @@ class MainWindow(QMainWindow):
         sess = self.session
         season = sess.season
 
-        def job(progress=None):
-            return sess.orchestrator(progress=progress).match_season(season)
+        def job(progress=None, should_stop=None):
+            return sess.run_operation('match_season', season, progress=progress, should_stop=should_stop)
 
         self._run_task(job, f"匹配 {season.key}")
 
     # ---- 推送（唯一会改动账号的动作）
 
-    _PUSH_STATUS = {"pushed": "已推送", "existed": "已存在", "failed": "失败"}
+    _PUSH_STATUS = {"pushed": "已推送", "existed": "已存在", "failed": "失败", "pending": "未尝试", "skipped": "已跳过"}
+
+    def _current_push_plan(self):
+        default = self.env.playlist.text().strip() or self.session.playlist_name
+        choices = [{**r, "playlist": str(r.get("playlist") or "").strip() or default}
+                   for r in self.pages[3].all_rows()]
+        return self.session.orchestrator().build_push_plan(self.session.season, selections=choices)
 
     def _push_dry_run(self) -> None:
-        """试运行 —— 不碰客户端、不写入，只列出清单。
-
-        刻意不查客户端：没装/没开也能先看清单，
-        这正是「先看清楚再动手」的价值。
-
-        ⚠️ **必须和真推送同一套判据**：清单来自 `push_selected_rows()` 这条主线
-        （勾选项 ∩ 数据库可推）+ **按行目标歌单分组**，而不是
-        `orchestrator.push_season(dry_run=True)` —— 那里面用的是 `pushable()` 全量，
-        既不看勾选、也不看每行的歌单。
-
-        修之前这里就是这么错的，而且错得很讽刺：docstring 里已经写着
-        「否则试运行显示『会推 8 首』、真推送只推 5 首」，
-        但代码把 `push_selected_rows()` 的返回值**丢掉了**，然后照样调
-        `push_season(dry_run=True)` —— 于是那句警告说的正是它自己。
-        """
-        sess = self.session
-        default_playlist = self.env.playlist.text().strip() or sess.playlist_name
-        # 与 `_push_songs()` 完全同一条主线，唯一差别是不发请求
-        groups = self._group_by_playlist(self.push_selected_rows(), default_playlist)
-        if not groups:
-            self.log("  （第④步没有勾选任何歌，或勾选的行在数据库里都不满足"
-                     "「可推送」的条件）")
-            return
-        total = sum(len(g) for g in groups.values())
-        self.log(f"试运行：将推送 {total} 首到 {len(groups)} 个歌单（未写入）")
-        for name, g in groups.items():
-            self.log(f"  歌单「{name}」{len(g)} 首")
-            for r in g:
-                head = " ".join(x for x in (r.get("anime"), r.get("kind")) if x)
-                self.log(f"    · {head} — {r.get('name') or ''}")
+        orch = self.session.orchestrator()
+        report = orch.execute_push_plan(self._current_push_plan(), dry_run=True)
+        for line in orch.describe_push(report):
+            self.log(line)
 
     def push_selected_rows(self) -> list[dict]:
-        """勾选的行 ∩ 「数据库里确实可推」= 真正会发给 collector 的行。
-
-        为什么取**交集**而不是只用勾选项：`pushable()` 的判据（有选中的候选、
-        状态是 auto/confirmed、候选带 song_id）是写入能成功的前提；
-        勾选的行里混着不满足条件的（例如刚被改成待审核）就不能硬推。
-
-        ⚠️ 这个方法**只读**，绝不能在这里改数据库：
-        真推送和「试运行」都会调它，如果在里面写库，第一次调用就把后面要推的状态吃掉了
-        —— 试运行会把真推送的对象清空。
-        也**不做**任何「没勾选就记为跳过」的落库：见 `_push_songs` 里那段说明，
-        取消勾选只意味着「这次先不推」。
-        """
-        pushable = {str(it["song_id"]): it for it in
-                    self.session.orchestrator().pushable(self.session.season)}
-        out = []
-        for r in self.pages[3].checked_push_rows():
-            it = pushable.get(str(r.get("netease_song_id") or ""))
-            if it is None:
-                continue
-            # 保留行里的目标歌单（用户可能逐行改过）
-            out.append({**it, "playlist": r.get("playlist") or ""})
-        return out
+        from dataclasses import asdict
+        return [asdict(it) for it in self._current_push_plan().items]
 
     def _push_songs(self) -> None:
-        """推送 —— **只推用户勾选的**，**按每行的目标歌单分组**。
-
-        ⚠️ 这条路径会真的往账号里写数据（离线测试只覆盖到「交给 collector 什么」，
-        没有真机验证）。修之前这里有两个会写错东西的缺陷：
-
-        · `orchestrator.pushable(season)` 是全量 —— 第④步里取消勾选毫无作用；
-        · `push_season` 只认 `constants.playlist_name(season)` 一个歌单 ——
-          每行那个可编辑的「目标歌单」列被彻底忽略。
-
-        为什么没有直接给 `push_season` 加 `only_theme_ids=`：
-        那需要改 `orchestrator.py`（本轮明确不许碰），所以改成在 GUI 侧
-        按「勾选 + 歌单」分组后逐组调用 `_push_group`。
-        建议的 orchestrator 侧演进见本轮报告：`push_season(..., only_theme_ids=...)`。
-        """
-        sess = self.session
-        rows = self.pages[3].checked_push_rows()
-        if not rows:
-            QMessageBox.information(
-                self, "没有可推送的曲目",
-                "第④步没有勾选任何歌，或者还没有「自动通过」/「人工确认」的匹配。\n\n"
-                "请先到第③步完成匹配并确认，并确认第④步里有勾选。",
-            )
+        plan = self._current_push_plan()
+        if not plan.items:
+            QMessageBox.information(self, "没有可推送的曲目", "请先到第③步确认匹配，并在第④步勾选要推送的歌曲。")
             return
-
-        default_playlist = self.env.playlist.text().strip() or sess.playlist_name
-        groups = self._group_by_playlist(self.push_selected_rows(), default_playlist)
-        if not groups:
-            QMessageBox.information(
-                self, "没有可推送的曲目",
-                "勾选的行在数据库里都不满足「可推送」的条件"
-                "（需要有选中的候选且状态为自动通过/人工确认）。\n\n"
-                "请回到第③步确认匹配结果。",
-            )
-            return
-        # 预览里把「哪个歌单几首」说清楚 —— 分组推送是这次修的核心，
-        # 用户必须在动手之前就知道会写到几个歌单里
-        detail = "\n".join(f"· 歌单「{name}」{len(g)} 首" for name, g in groups.items())
+        groups = {}
+        for it in plan.items:
+            groups[it.playlist] = groups.get(it.playlist, 0) + 1
+        detail = "\n".join(f"· 歌单「{name}」{count} 首" for name, count in groups.items())
         ok = QMessageBox.question(
-            self,
-            "确认推送",
-            f"将把勾选的 {sum(len(g) for g in groups.values())} 首歌"
-            f"加入 {len(groups)} 个歌单：\n\n"
-            f"{detail}\n\n"
-            f"· 已在歌单里的会自动跳过\n"
-            f"· 限速约 1 首/秒，请勿关闭窗口\n"
-            f"· 失败的单首会列出原因，不影响其它\n\n"
-            f"继续吗？",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
-        )
+            self, "确认推送", f"将把勾选的 {len(plan.items)} 首歌加入 {len(groups)} 个歌单：\n\n{detail}\n\n"
+            "已在歌单里的会回查后跳过；停止时会先完成当前歌曲的确认与记账。\n继续吗？",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if ok != QMessageBox.Yes:
             self.log("已取消推送")
             return
-
-        # ⚠️ 这里**刻意不**把「没勾选的行」落成 `SKIPPED` 决策。
-        #
-        # 曾经有过一版这么做（`_mark_unselected_skipped`），理由是「不写的话取消勾选
-        # 只是个界面动作，下次重跑匹配它又变回候选」。但那个理由站不住：
-        #
-        # · 在确认对话框里取消勾选，自然含义是**「这次先不推」**，不是「永久跳过」；
-        # · 它会粉碎**分批推送** —— 40 首里先推 5 首，其余 35 首全被写成 SKIPPED
-        #   （而限速 1 首/秒、对话框自己还写着「请勿关闭窗口」，分批本来就是合理用法）；
-        # · 恢复要回第③步逐条重新确认，而第③步**当时根本没有「跳过」这个动作** ——
-        #   也就是说 `DecisionStatus.SKIPPED` 唯一的产生方式，是用户猜不到的副作用。
-        #
-        # 想永久跳过就该由用户**显式**表达，那属于第③步的一个动作，不是推送的副产品。
-        # 见 HANDOFF.md 的待办：第③步加「跳过」按钮（那时 SKIPPED 才是真决定）。
-
-        label = (f"推送到「{default_playlist}」" if len(groups) == 1
-                 else f"推送到 {len(groups)} 个歌单")
-
-        def job(progress=None):
-            return self._push_groups(groups, progress=progress)
-
-        self._run_task(job, label, on_done=self._push_done)
-
-    # ---- 只推勾选项 / 按歌单分组的实现
+        # 确认的是冻结的计划，不从后台线程再读取会变化的页面或季度。
+        orch = self.session.orchestrator()
+        def job(progress=None, should_stop=None):
+            return orch.execute_push_plan(plan, self._make_push_collector(), progress=progress, should_stop=should_stop)
+        self._run_task(job, f"推送到 {len(groups)} 个歌单", on_done=self._push_done, refresh_on_success=False)
 
     @staticmethod
     def _group_by_playlist(rows: list[dict], default: str) -> dict[str, list[dict]]:
@@ -1484,106 +1473,16 @@ class MainWindow(QMainWindow):
 
         return DesktopCDPCollector(self.session.config.netease.debug_port)
 
-    def _push_groups(self, groups: dict[str, list[dict]], progress=None) -> PushReport:
-        """逐组推送，合成一份报告。（在后台线程里执行）
-
-        为什么要自己写这段循环而不用 `push_season`：
-        见 `_push_songs` 的说明 —— 需要「只推这些 theme」+「推到这个歌单」，
-        而这两个都不能通过 `push_season` 的公开签名表达。
-        下面刻意**照抄 `orchestrator.push_season` 的写入语义**（幂等台账、
-        `last_write_action` 才算「新推」、失败逐条留原因），改动时请两边一起改。
-
-        ⚠️ **`fatal` 必须往上传**（踩过）：第一版只做了
-        `merged.items.extend(子报告.items)`。而客户端不可用时 `_push_group`
-        返回的是「有 `fatal`、零条目」的报告 —— 合并后 `fatal` 变回空串，
-        于是 `_push_done` / `describe_push` 都看不出出过事，
-        **界面显示一切正常，实际一首都没推**。这正是本项目最不能接受的那类失败。
-        客户端没了就是整批没意义，第一组报了 fatal 就停下。
-        """
-        sess = self.session
-        col = self._make_push_collector()
-        merged = PushReport(season=sess.season)
-
-        for name, rows in groups.items():
-            sub = self._push_group(col, name, rows, progress)
-            merged.items.extend(sub.items)
-            if sub.fatal:
-                merged.fatal = sub.fatal
-                if progress:
-                    progress(f"  客户端不可用，剩下的歌单不再尝试：{sub.fatal}")
-                break
-
-        return merged
+    def _push_groups(self, groups: dict[str, list[dict]], progress=None, should_stop=None, collector=None) -> PushReport:
+        """兼容旧接线入口，执行规则只有编排层的一份。"""
+        orch = self.session.orchestrator()
+        choices = [{**r, "playlist": name} for name, rows in groups.items() for r in rows]
+        plan = orch.build_push_plan(self.session.season, selections=choices)
+        col = collector if collector is not None else self._make_push_collector()
+        return orch.execute_push_plan(plan, col, progress=progress, should_stop=should_stop)
 
     def _push_group(self, collector, name: str, rows: list[dict], progress=None) -> PushReport:
-        say = progress or self.log
-        rep = PushReport(season=self.session.season, playlist=name)
-
-        st = collector.health()
-        if not st.ok:
-            rep.fatal = st.detail
-            say(f"客户端不可用：{st.detail}")
-            return rep
-
-        say(f"准备歌单「{name}」…")
-        try:
-            existed = collector.find_playlist(name)
-            ref = collector.ensure_playlist(name)
-            rep.playlist_id = getattr(ref, "netease_id", None)
-            rep.playlist_created = existed is None
-            self.session.store.save_playlist(name, rep.playlist_id, self.session.season_id)
-            say(f"  歌单 {'已存在，复用' if existed else '已创建'}（id={rep.playlist_id}）")
-        except Exception as e:  # noqa: BLE001
-            rep.fatal = f"准备歌单失败：{type(e).__name__}: {e}"
-            say(rep.fatal)
-            return rep
-
-        total = len(rows)
-        for n, r in enumerate(rows, 1):
-            # 行的键来自两处：`orchestrator.pushable()` 用 song_id，
-            # 第④步的表格行用 netease_song_id。两种都认，别只认一个 ——
-            # 踩过的坑：只认 netease_song_id 时从 pushable 来的行取到空串，
-            # 于是「推送」会把空 ID 发给客户端（界面一切正常，歌一首没进）。
-            song_id = str(r.get("song_id") or r.get("netease_song_id") or "")
-            theme_id = r.get("theme_id")
-            was = self.session.store.is_pushed(name, song_id)
-            try:
-                ok = collector.add_to_playlist(song_id, ref)
-            except Exception as e:  # noqa: BLE001
-                ok = False
-                err = f"{type(e).__name__}: {e}"
-            else:
-                err = getattr(collector, "last_write_error", "") or ""
-
-            note = getattr(collector, "last_write_note", "") or ""
-            action = getattr(collector, "last_write_action", None)
-
-            if ok:
-                self.session.store.mark_pushed(name, song_id, theme_id)
-                # 「本次新推」的判据是 collector 实际做了什么，不是我们的台账 ——
-                # 歌单里本来就有这首歌时它零 dispatch 返回 True，
-                # 只按台账判断会把「跳过」报成「新推送」。
-                if action is None:
-                    status = "existed" if was else "pushed"
-                else:
-                    status = "pushed" if action == _write_action_added() else "existed"
-            else:
-                status = "failed"
-
-            rep.items.append(PushItem(
-                theme_id=theme_id if isinstance(theme_id, int) else 0,
-                anime=r.get("anime") or "",
-                kind=r.get("kind") or "",
-                target_title=r.get("name") or "",
-                song_id=song_id, name=r.get("name") or "",
-                status=status, note=note, error="" if ok else err,
-            ))
-            mark = {"pushed": "＋", "existed": "＝", "failed": "✗"}[status]
-            say(f"  [{n}/{total}] {mark} {str(r.get('name') or '')[:28]}"
-                + (f"  {err[:60]}" if not ok else ""))
-
-        say(f"歌单「{name}」：{rep.summary()}")
-        return rep
+        return self._push_groups({name: rows}, progress=progress, collector=collector)
 
     def _push_done(self, rep: PushReport) -> None:
         for line in self.session.orchestrator().describe_push(rep):
@@ -1599,13 +1498,11 @@ class MainWindow(QMainWindow):
         # 而失败项不在台账里（只有成功才入库），reload 后再也回不来。
         # 结果就是：用户看到一句「部分失败」的弹窗，然后表格里一切正常，
         # 根本不知道是哪几首。失败状态必须留在表格上让人能核对。
-        # 已知取舍：成功项要等下一次 reload 才会显示成「已推送」，
-        # 推送结果本身已经逐行打进日志了。
         self.pages[3].mark_results({
-            str(it.song_id): self._PUSH_STATUS.get(it.status, it.status)
-            for it in rep.items
+            (it.playlist or rep.playlist, str(it.song_id)): self._PUSH_STATUS.get(it.status, it.status)
+            for it in rep.items + rep.untried
         })
-        if rep.failed:
+        if rep.failed and not getattr(self, "_closing", False):
             QMessageBox.warning(
                 self, "部分失败",
                 f"{len(rep.failed)} 首没能加入歌单，原因已列在日志和表格里。\n\n"
@@ -1631,6 +1528,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "检查歌单失败", f"{type(e).__name__}: {e}")
 
     # ---------------------------------------------------------------- 日志 / 状态
+    @Slot(str)
     def log(self, msg: str) -> None:
         self.logpane.log(msg)
 
@@ -1728,6 +1626,8 @@ class MainWindow(QMainWindow):
 
     # ---------------------------------------------------------------- 导航
     def _goto(self, i: int) -> None:
+        if self._closing or (self.worker is not None and self.worker.isRunning()):
+            return
         i = max(0, min(len(self.pages) - 1, i))
         self.stack.setCurrentIndex(i)
         self.stepper.set_current(i)
@@ -1779,7 +1679,6 @@ class MainWindow(QMainWindow):
 
     def _next(self) -> None:
         i = self.stack.currentIndex()
-        self.stepper.set_state(i, "confirmed")
         # ← 先把本步的人工修改落库，再往下走（手工值优先于拉取值，§8.2）
         #
         # ⚠️ 每一步都读 `page.all_rows()`（**全量**），不是 `model.rows` 里"看得见的"。
@@ -1814,6 +1713,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "保存失败", f"{type(e).__name__}: {e}")
             return
 
+        self.stepper.set_state(i, "confirmed")
         if i < len(self.pages) - 1:
             self._goto(i + 1)
             self.reload(preserve_included=False)
@@ -1879,20 +1779,32 @@ class MainWindow(QMainWindow):
             self._goto(i - 1)
             self.log("↑ 回退。下游步骤已标记为「需重跑」，但数据保留（不清空）。")
 
-    def closeEvent(self, event) -> None:  # noqa: N802 - Qt 命名
-        """退出前把后台线程与定时器收干净。
+    def _active_workers(self):
+        candidates = (self.worker, getattr(self.env, "_worker", None), getattr(self.env, "_launch_worker", None))
+        return [w for w in candidates if w is not None and w.isRunning()]
 
-        否则 Qt 会打印 "QThread: Destroyed while thread is still running"，
-        在受限环境里还可能直接崩。探测、拉取、匹配都跑在线程里，必须等它们结束。
+    @Slot()
+    def _finish_close_when_ready(self) -> None:
+        if self._closing and not self._active_workers():
+            self.close()
 
-        定时器也要在这里 `stop()`：带活动定时器的 QObject 若在别的线程里被析构，
-        Qt 会报 "Timers cannot be stopped from another thread"（见 __init__ 的注释）。
-        """
+    def closeEvent(self, event) -> None:  # noqa: N802
+        self._closing = True
+        self.env._closing = True
         self._timer.stop()
-        for w in (getattr(self.env, "_worker", None), self.worker):
-            if w is not None and w.isRunning():
-                w.quit()
-                if not w.wait(2000):
-                    w.terminate()
-                    w.wait(500)
-        super().closeEvent(event)
+        self._busy(False)
+        active = self._active_workers()
+        if active:
+            event.ignore()
+            self.status.showMessage("正在等待当前操作完成，随后自动关闭…")
+            for worker in active:
+                if hasattr(worker, "request_stop"):
+                    worker.request_stop()
+                else:
+                    worker.requestInterruption()
+                if not getattr(worker, "_close_connected", False):
+                    worker.finished.connect(self._finish_close_when_ready)
+                    worker._close_connected = True
+            return
+        self.session.close()
+        event.accept()

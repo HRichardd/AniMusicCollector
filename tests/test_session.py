@@ -344,6 +344,9 @@ class TestPersistence(SessionTestBase):
 
         titles = {r["song_title"]: r for r in self.store.theme_list(self.sid)}
         self.assertIn("Edited", titles)
+        self.assertNotIn("Original", titles)
+        self.assertEqual(titles["Edited"]["id"], tid)
+        self.assertEqual(len(titles), 2)
         self.assertEqual(json.loads(titles["Edited"]["artists"]), ["B", "C"])
         self.assertIn("Brand New", titles)
         self.assertEqual(titles["Brand New"]["origin"], "manual")

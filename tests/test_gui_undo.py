@@ -722,7 +722,7 @@ class TestUndoShortcutWiring(GuiTestBase):
             duration_ms=240_000, score=0.9, score_detail={"title": 1.0},
             origin=Origin.SEARCH,
         ))
-        self.win = MainWindow(self.sess)
+        self.win = MainWindow(self.sess, probe_enabled=False)
         self.win.resize(1200, 800)
         self.win.show()                 # offscreen：没人看着，也不弹任何模态框（§2）
         self.win.activateWindow()

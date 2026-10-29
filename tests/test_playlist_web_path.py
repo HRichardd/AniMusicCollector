@@ -453,6 +453,35 @@ class TestMembershipSourcePriority(unittest.TestCase):
         self.assertIs(m.present, True)
         self.assertIn(("snapshot", "9999"), self.web.calls)
 
+    def test_stale_store_zero_does_not_hide_a_song_present_on_server(self):
+        self.web.data["1004"] = _snap("1004", ids=["999"])
+        c = self._collector()
+        m = c._membership(PlaylistRef(name="别人建的歌单", netease_id="1004"), "999", refresh=False)
+        self.assertIs(m.present, True)
+        self.assertEqual(self.web.calls, [("snapshot", "1004")])
+
+    def test_store_zero_with_web_failure_is_unknown(self):
+        self.web.data["1004"] = ap.WebPlaylistError("离线模拟读取失败")
+        c = self._collector()
+        m = c._membership(PlaylistRef(name="别人建的歌单", netease_id="1004"), "999", refresh=False)
+        self.assertIsNone(m.present)
+        self.assertIn("web API", m.reason)
+
+    def test_stale_zero_with_partial_tracks_still_checks_server_for_absence(self):
+        entries = self.state["playlist"]["myPlaylist"]
+        entries[3]["tracks"] = list(entries[1]["tracks"])
+        self.web.data["1004"] = _snap("1004", ids=["601", "999"])
+        c = self._collector()
+        m = c._membership(PlaylistRef(name="别人建的歌单", netease_id="1004"), "999", refresh=False)
+        self.assertIs(m.present, True)
+        self.assertEqual(self.web.calls, [("snapshot", "1004")])
+
+    def test_server_verified_empty_playlist_is_still_absent(self):
+        self.web.data["1004"] = _snap("1004", ids=[])
+        c = self._collector()
+        m = c._membership(PlaylistRef(name="别人建的歌单", netease_id="1004"), "999", refresh=False)
+        self.assertIs(m.present, False)
+
     def test_playlist_absent_from_store_still_consults_the_web(self):
         """store 里压根没有这个歌单（用户刚在别处建的）→ 仍该去 web 问一次。"""
         self.web.data["7777"] = _snap("7777", ids=["999"])

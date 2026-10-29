@@ -16,9 +16,11 @@ GUI 的后台任务（`gui/workers.py` 的 `TaskWorker`）在别的线程里调�
 
 from __future__ import annotations
 
+import logging
 import os
 import sqlite3
 import threading
+from contextlib import contextmanager
 from datetime import date, datetime
 from typing import Any, Iterable
 
@@ -37,6 +39,13 @@ from .models import (
     artists_from_json,
     artists_to_json,
 )
+
+logger = logging.getLogger(__name__)
+
+
+class ThemeIdentityConflict(ValueError):
+    """来源无法唯一指向旧记录，必须保留原数据交给人工处理。"""
+
 
 SCHEMA = """
 PRAGMA journal_mode = WAL;
@@ -90,6 +99,9 @@ CREATE TABLE IF NOT EXISTS theme (
     song_title TEXT    NOT NULL,
     artists    TEXT    NOT NULL,
     source     TEXT    NOT NULL,
+    source_kind TEXT,
+    source_sequence INTEGER,
+    source_song_title TEXT,
     raw        TEXT,
     origin     TEXT NOT NULL DEFAULT 'animethemes',
     included   INTEGER NOT NULL DEFAULT 1,
@@ -168,7 +180,7 @@ CREATE TABLE IF NOT EXISTS push_selection (
     target_playlist TEXT    NOT NULL DEFAULT '',
     included        INTEGER NOT NULL DEFAULT 1,
     updated_at      TEXT    NOT NULL DEFAULT (datetime('now')),
-    UNIQUE (season_id, netease_song_id)
+    UNIQUE (season_id, theme_id, netease_song_id)
 );
 
 CREATE TABLE IF NOT EXISTS http_cache (
@@ -213,7 +225,64 @@ class Store:
         self._lock = threading.Lock()
         self._closed = False
         self.conn.executescript(SCHEMA)     # 建表（顺带在当前线程建出第一条连接）
-        self.conn.commit()
+        self._migrate_theme_identity()
+        self._migrate_push_selection()
+        self._commit()
+
+    def _migrate_push_selection(self) -> None:
+        unique_columns = [tuple(r["name"] for r in self.conn.execute(
+            f"PRAGMA index_info('{idx['name']}')"))
+            for idx in self.conn.execute("PRAGMA index_list(push_selection)") if idx["unique"] and not idx["partial"]]
+        with self.transaction():
+            if ("season_id", "netease_song_id") in unique_columns:
+                # 同一歌曲在不同曲目行可有不同目标；迁移只改选择表，不碰推送台账。
+                ddl = SCHEMA.split("CREATE TABLE IF NOT EXISTS push_selection (", 1)[1].split(");", 1)[0]
+                self.conn.execute("CREATE TABLE push_selection_new (" + ddl + ")")
+                self.conn.execute("INSERT INTO push_selection_new SELECT * FROM push_selection")
+                self.conn.execute("DROP TABLE push_selection")
+                self.conn.execute("ALTER TABLE push_selection_new RENAME TO push_selection")
+            self.conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_push_selection_unbound "
+                              "ON push_selection(season_id,netease_song_id) WHERE theme_id IS NULL")
+
+    def _migrate_theme_identity(self) -> None:
+        columns = {r["name"] for r in self.conn.execute("PRAGMA table_info(theme)")}
+        with self.transaction():
+            for name, kind in (("source_kind", "TEXT"), ("source_sequence", "INTEGER"),
+                               ("source_song_title", "TEXT")):
+                if name not in columns:
+                    self.conn.execute(f"ALTER TABLE theme ADD COLUMN {name} {kind}")
+            # 人工记录的原名无法从当前标题还原；不能拿猜测的身份覆盖来源记录。
+            self.conn.execute(
+                "UPDATE theme SET source_kind=kind, source_sequence=sequence, "
+                "source_song_title=song_title WHERE source_song_title IS NULL "
+                "AND origin!='manual' AND source!='manual'")
+            unresolved = self.conn.execute(
+                "SELECT COUNT(*) FROM theme WHERE source_song_title IS NULL "
+                "AND origin='manual' AND source!='manual'").fetchone()[0]
+            if unresolved:
+                logger.warning("%d 条旧人工曲目缺少原始来源身份，保留原样，不自动合并", unresolved)
+
+    def _commit(self) -> None:
+        if not getattr(self._local, "transaction_depth", 0):
+            self.conn.commit()
+
+    @contextmanager
+    def transaction(self):
+        """页面保存使用保存点，嵌套的 upsert 不得把半张表提前提交。"""
+        depth = getattr(self._local, "transaction_depth", 0)
+        name = f"animusic_save_{depth}"
+        conn = self.conn
+        conn.execute(f"SAVEPOINT {name}")
+        self._local.transaction_depth = depth + 1
+        try:
+            yield
+            conn.execute(f"RELEASE SAVEPOINT {name}")
+        except BaseException:
+            conn.execute(f"ROLLBACK TO SAVEPOINT {name}")
+            conn.execute(f"RELEASE SAVEPOINT {name}")
+            raise
+        finally:
+            self._local.transaction_depth = depth
 
     # ---------------------------------------------------------------- 连接
 
@@ -309,7 +378,7 @@ class Store:
             "INSERT INTO season (year, quarter, playlist_name) VALUES (?,?,?)",
             (year, quarter, name),
         )
-        self.conn.commit()
+        self._commit()
         return int(cur.lastrowid)
 
     def season_playlist_name(self, season_id: int) -> str:
@@ -356,7 +425,7 @@ class Store:
                 now if confirmed else None,
             ),
         )
-        self.conn.commit()
+        self._commit()
 
     def mark_downstream_dirty(self, season_id: int, from_stage: Stage | str) -> None:
         """上游被改过 → 下游标 dirty，但**保留数据不清空**（§8.4）。"""
@@ -368,7 +437,7 @@ class Store:
         for s in order[i + 1:]:
             if self.get_stage(season_id, s) in (StageStatus.CONFIRMED, StageStatus.FETCHED):
                 self.set_stage(season_id, s, StageStatus.DIRTY)
-        self.conn.commit()
+        self._commit()
 
     # ================================================================ 番剧
 
@@ -404,7 +473,7 @@ class Store:
                     str(a.season_bucket), str(a.origin), int(a.included), a.note or "",
                 ),
             )
-            self.conn.commit()
+            self._commit()
             return int(cur.lastrowid)
 
         # 已存在
@@ -433,7 +502,7 @@ class Store:
         if sets:
             vals.append(existing["id"])
             self.conn.execute(f"UPDATE anime SET {', '.join(sets)} WHERE id=?", vals)
-            self.conn.commit()
+            self._commit()
         return int(existing["id"])
 
     def anime_list(self, season_id: int, only_included: bool = True) -> list[sqlite3.Row]:
@@ -445,7 +514,7 @@ class Store:
 
     def set_anime_included(self, anime_id: int, included: bool) -> None:
         self.conn.execute("UPDATE anime SET included=? WHERE id=?", (int(included), anime_id))
-        self.conn.commit()
+        self._commit()
 
     def exclude_supplemental_anime(self, season_id: int) -> list[str]:
         """把「仅从 AnimeThemes 拉当季」带进来的番**取消纳入**，返回它们的名字。
@@ -469,40 +538,46 @@ class Store:
             self.conn.executemany(
                 "UPDATE anime SET included=0 WHERE id=?", [(r["id"],) for r in rows]
             )
-            self.conn.commit()
+            self._commit()
         return [r["title_cn"] or r["title_jp"] or r["title_romaji"] or "?" for r in rows]
 
     # ================================================================ 曲目
 
     def upsert_theme(self, anime_id: int, t: Theme) -> int:
-        existing = self.conn.execute(
-            """
-            SELECT * FROM theme
-            WHERE anime_id=? AND kind=? AND COALESCE(sequence,0)=COALESCE(?,0)
-              AND song_title=?
-            """,
-            (anime_id, str(t.kind), t.sequence, t.song_title),
-        ).fetchone()
+        matches = list(self.conn.execute(
+            "SELECT * FROM theme WHERE anime_id=? AND source=? AND source_kind=? "
+            "AND COALESCE(source_sequence,0)=COALESCE(?,0) AND source_song_title=?",
+            (anime_id, t.source, str(t.kind), t.sequence, t.song_title)))
+        if len(matches) > 1:
+            raise ThemeIdentityConflict(f"曲目来源身份有歧义：anime_id={anime_id}, title={t.song_title!r}")
+        existing = matches[0] if matches else None
         if existing is None and t.song_title:
-            existing = self.conn.execute(
+            legacy = list(self.conn.execute(
                 "SELECT * FROM theme WHERE anime_id=? AND kind=? AND song_title=?",
                 (anime_id, str(t.kind), t.song_title),
-            ).fetchone()
+            ))
+            if len(legacy) > 1:
+                raise ThemeIdentityConflict(f"曲目标题有歧义：anime_id={anime_id}, title={t.song_title!r}")
+            existing = legacy[0] if legacy else None
 
         if existing is None:
             cur = self.conn.execute(
                 """
                 INSERT INTO theme (anime_id, kind, sequence, song_title, artists,
-                                   source, origin, included, note)
-                VALUES (?,?,?,?,?,?,?,?,?)
+                                   source, origin, included, note,
+                                   source_kind, source_sequence, source_song_title)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     anime_id, str(t.kind), t.sequence, t.song_title,
                     artists_to_json(t.artists), t.source, str(t.origin),
                     int(t.included), t.note or "",
+                    str(t.kind) if t.origin != Origin.MANUAL else None,
+                    t.sequence if t.origin != Origin.MANUAL else None,
+                    t.song_title if t.origin != Origin.MANUAL else None,
                 ),
             )
-            self.conn.commit()
+            self._commit()
             return int(cur.lastrowid)
 
         protected = existing["origin"] == str(Origin.MANUAL)
@@ -514,7 +589,7 @@ class Store:
         for k, v in fields.items():
             if v is None or v == "":
                 continue
-            if protected and existing[k] not in (None, ""):
+            if protected and existing[k] not in (None, "", "[]"):
                 continue
             if existing[k] == v:
                 continue
@@ -523,7 +598,7 @@ class Store:
         if sets:
             vals.append(existing["id"])
             self.conn.execute(f"UPDATE theme SET {', '.join(sets)} WHERE id=?", vals)
-            self.conn.commit()
+            self._commit()
         return int(existing["id"])
 
     def theme_list(self, season_id: int, only_included: bool = True) -> list[sqlite3.Row]:
@@ -576,7 +651,7 @@ class Store:
                 """,
                 (theme_id, c.query_used, c.netease_song_id, *fields[1:], str(c.origin)),
             )
-            self.conn.commit()
+            self._commit()
             return int(cur.lastrowid)
 
         if existing["origin"] == str(Origin.MANUAL):
@@ -591,7 +666,7 @@ class Store:
             """,
             (*fields, existing["id"]),
         )
-        self.conn.commit()
+        self._commit()
         return int(existing["id"])
 
     def candidate_list(self, theme_id: int) -> list[sqlite3.Row]:
@@ -631,7 +706,7 @@ class Store:
             """,
             (theme_id, candidate_id, str(status), decided_by, note),
         )
-        self.conn.commit()
+        self._commit()
 
     def decision_map(self, season_id: int) -> dict[int, sqlite3.Row]:
         rows = self.conn.execute(
@@ -686,7 +761,7 @@ class Store:
             "INSERT OR IGNORE INTO pushed (playlist_name, netease_song_id, theme_id) VALUES (?,?,?)",
             (playlist_name, str(song_id), theme_id),
         )
-        self.conn.commit()
+        self._commit()
 
     def pushed_songs(self, playlist_name: str) -> set[str]:
         rows = self.conn.execute(
@@ -702,58 +777,42 @@ class Store:
             """,
             (name, netease_id, season_id),
         )
-        self.conn.commit()
+        self._commit()
 
     # ================================================================ 步骤④ 的选择
 
     def save_push_selection(self, season_id: int, rows: Iterable[dict]) -> int:
-        """把第④步的勾选与逐行「目标歌单」落库。返回写入的行数。
-
-        **只动 `push_selection`，绝不碰 `decision`** —— 这是之前那个
-        IntegrityError 的根因（见 SCHEMA 里 `push_selection` 的注释）。
-
-        没有 `netease_song_id` 的行（刚点「+ 手动加歌」还没填 ID 的）跳过：
-        标识不了就没法存，存了也会在回读时错位。
-        页面上已经不存在的行会被删掉，否则回读时会把用户删掉的歌复活。
-        """
-        keep: list[str] = []
-        for r in rows:
-            sid = str(r.get("netease_song_id") or "").strip()
-            if not sid:
+        """按曲目与歌曲保存全量选择，避免同一歌曲的不同目标互相覆盖。"""
+        prepared = []
+        for row in rows:
+            song = str(row.get("netease_song_id") or "").strip()
+            if not song:
                 continue
-            keep.append(sid)
-            tid = r.get("theme_id")
-            self.conn.execute(
-                """
-                INSERT INTO push_selection (season_id, netease_song_id, theme_id,
-                                            target_playlist, included, updated_at)
-                VALUES (?,?,?,?,?,datetime('now'))
-                ON CONFLICT(season_id, netease_song_id) DO UPDATE SET
-                    theme_id        = excluded.theme_id,
-                    target_playlist = excluded.target_playlist,
-                    included        = excluded.included,
-                    updated_at      = datetime('now')
-                """,
-                (
-                    season_id, sid,
-                    tid if isinstance(tid, int) else None,
-                    str(r.get("playlist") or ""),
-                    int(bool(r.get("included", True))),
-                ),
-            )
+            tid = row.get("theme_id")
+            if tid is not None:
+                owner = self.conn.execute("SELECT a.season_id FROM theme t JOIN anime a ON a.id=t.anime_id WHERE t.id=?",
+                                          (tid,)).fetchone()
+                if owner is None or owner[0] != season_id:
+                    raise ValueError("推送选择的曲目不属于当前季度")
+            prepared.append((song, tid, str(row.get("playlist") or "").strip(), int(bool(row.get("included", True)))))
+        keep = {(tid, song) for song, tid, _, _ in prepared}
+        with self.transaction():
+            for song, tid, playlist, included in prepared:
+                self.conn.execute(
+                    "INSERT INTO push_selection(season_id,netease_song_id,theme_id,target_playlist,included) VALUES(?,?,?,?,?) "
+                    "ON CONFLICT DO UPDATE SET target_playlist=excluded.target_playlist, included=excluded.included, "
+                    "updated_at=datetime('now')", (season_id, song, tid, playlist, included))
+            existing = list(self.conn.execute("SELECT id,theme_id,netease_song_id FROM push_selection WHERE season_id=?",
+                                              (season_id,)))
+            for row in existing:
+                if (row["theme_id"], row["netease_song_id"]) not in keep:
+                    self.conn.execute("DELETE FROM push_selection WHERE id=?", (row["id"],))
+        return len(prepared)
 
-        existing = {
-            r["netease_song_id"] for r in self.conn.execute(
-                "SELECT netease_song_id FROM push_selection WHERE season_id=?", (season_id,)
-            )
-        }
-        for gone in existing - set(keep):
-            self.conn.execute(
-                "DELETE FROM push_selection WHERE season_id=? AND netease_song_id=?",
-                (season_id, gone),
-            )
-        self.conn.commit()
-        return len(keep)
+    def push_selection_rows(self, season_id: int) -> list[dict]:
+        return [dict(r) for r in self.conn.execute(
+            "SELECT theme_id,netease_song_id,target_playlist AS playlist,included FROM push_selection WHERE season_id=? ORDER BY id",
+            (season_id,))]
 
     def push_selection_map(self, season_id: int) -> dict[str, dict[str, Any]]:
         """`song_id → {"included": bool, "playlist": str}`。

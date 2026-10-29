@@ -7,8 +7,7 @@
 设计要点：
     · 番剧匹配要处理**跨书写系统**（Bangumi 中日文名 vs AnimeThemes 罗马音），
       因此复用 normalize.name_similarity 的罗马音比较
-    · 二次过滤：年番/半年番在 AnimeThemes 里会跨季度出现，
-      只收属于目标季度的 theme（§5.3.5）
+    · 季度筛选在番单层完成；来源没有单首曲目的季度信息，保留已确认番剧的 OP/ED
     · 增量：默认跳过已有决策的 theme；`retry_missing` 只重试
       missing_source / missing_netease，不碰 missing_match（§5.12）
 """
@@ -43,7 +42,7 @@ from .query_builder import build_queries
 from .sources.animethemes import AnimeThemesSource, AtAnime
 from .sources.bangumi import BangumiSource
 from .sources.wikipedia import WIKI_TRY_BATCH, WikipediaSource
-from .store import Store
+from .store import Store, ThemeIdentityConflict
 
 Progress = Callable[[str], None]
 
@@ -117,6 +116,7 @@ class FetchReport:
 
 @dataclass
 class MatchReport:
+    """本次运行实际保存的匹配结果；themes_total 是当前纳入范围的总数。"""
     season: Season
     themes_total: int = 0
     searched: int = 0
@@ -131,7 +131,8 @@ class MatchReport:
 
     @property
     def decided(self) -> int:
-        return self.auto + self.pending_review + self.low + self.missing_source \
+        # low 是 missing_match 的子集，不能再加一次。
+        return self.auto + self.pending_review + self.missing_source \
             + self.missing_netease + self.missing_match
 
     @property
@@ -212,6 +213,27 @@ class UpdateReport:
         return " · ".join(bits)
 
 
+class OperationCancelled(Exception):
+    """在操作边界停止，避免把主动取消当作数据源缺失。"""
+
+
+@dataclass(frozen=True)
+class PushPlanItem:
+    theme_id: int
+    song_id: str
+    playlist: str
+    anime: str = ""
+    kind: str = ""
+    target_title: str = ""
+    name: str = ""
+
+
+@dataclass(frozen=True)
+class PushPlan:
+    season: Season
+    items: tuple[PushPlanItem, ...]
+
+
 @dataclass
 class PushItem:
     """一首歌的推送结果。"""
@@ -225,6 +247,7 @@ class PushItem:
     status: str = "pending"      # pushed | existed | skipped | failed | pending（未尝试）
     note: str = ""
     error: str = ""
+    playlist: str = ""
 
     @property
     def ok(self) -> bool:
@@ -249,6 +272,8 @@ class PushReport:
     #: 未尝试就是未尝试：单独一个列表，`status="pending"`（`PushItem.ok` 为假）。
     #: GUI 的表格状态取自台账 → 没进 items 的行仍显示「待推送」，这正是事实。
     untried: list[PushItem] = field(default_factory=list)
+    stopped: bool = False
+    playlists: dict[str, dict] = field(default_factory=dict)
 
     def _n(self, *statuses: str) -> int:
         return len([i for i in self.items if i.status in statuses])
@@ -271,7 +296,7 @@ class PushReport:
 
     @property
     def ok(self) -> bool:
-        return not self.fatal and not self.failed
+        return not self.fatal and not self.failed and not self.stopped
 
     def summary(self) -> str:
         if self.fatal:
@@ -280,8 +305,10 @@ class PushReport:
             # 但一首都没试（客户端一开始就不可用）时就是纯失败，别轻描淡写。
             return f"已中止：{self.fatal}" if self.items else f"失败：{self.fatal}"
         bits = []
+        if self.stopped:
+            bits.append(f"已停止 · 未尝试 {len(self.untried)}")
         if self.dry_run:
-            bits.append("（试运行，未写入）")
+            bits.append(f"（试运行，未写入）计划 {self._n('pending')} 首")
         if self.pushed:
             bits.append(f"新推送 {self.pushed}")
         if self.existed:
@@ -366,6 +393,8 @@ class Orchestrator:
         self.wikipedia = WikipediaSource(
             cache_ttl=fetch_cfg.wikipedia_cache_ttl, **self._http_kw
         )
+        self.animethemes.http.check_cancelled = self._check_cancelled
+        self.wikipedia.http.check_cancelled = self._check_cancelled
         #: AniList 的源**懒建但复用** —— 复用才能把它的请求数报进本步汇总。
         #: 它的缓存时长单独存一份：它的构造点在 `_anilist_pool()` 里
         #: （懒建），那边拿不到 `fetch_cfg`。
@@ -381,6 +410,11 @@ class Orchestrator:
         self._at_pool_by_season: dict[str, list[AtAnime]] = {}
 
     # ---- 网络事件的落点
+
+    def _check_cancelled(self) -> None:
+        stop = getattr(self, "should_stop", None)
+        if stop is not None and stop():
+            raise OperationCancelled("已停止后续处理，已完成的数据保留")
 
     def _note_http(self, msg: str) -> None:
         """单个请求级别的日志 —— 慢请求与失败。
@@ -516,6 +550,14 @@ class Orchestrator:
 
     # ---- 曲目来源：维基优先，AnimeThemes 回退
 
+    def _save_fetched_theme(self, anime_id: int, theme: Theme) -> bool:
+        try:
+            self.store.upsert_theme(anime_id, theme)
+        except ThemeIdentityConflict as e:
+            self.progress(f"    ! {e}，跳过本条；请人工排除重复项")
+            return False
+        return True
+
     def _collect_themes(self, names: list[str], at: AtAnime | None) -> tuple[list[dict], str]:
         """给一部番取 OP/ED。返回 (曲目列表, 来源说明)。
 
@@ -539,6 +581,7 @@ class Orchestrator:
         """
         # ---- 主路径：维基（熔断之后不再向它发请求）
         blocked = getattr(self, "_wiki_blocked", "")
+        self._check_cancelled()
         if blocked:
             wikis, page = [], ""
         else:
@@ -562,6 +605,7 @@ class Orchestrator:
             except Exception as e:  # noqa: BLE001 - 维基挂了不该让整季失败
                 self.progress(f"    维基查询失败，回退 AnimeThemes：{e}")
                 wikis, page = [], ""
+        self._check_cancelled()
         if wikis:
             return (
                 [{"kind": t.kind, "song_title": t.song_title, "artists": t.artists,
@@ -575,7 +619,7 @@ class Orchestrator:
             return (
                 [{"kind": t.kind, "song_title": t.song_title, "artists": t.artists,
                   "sequence": t.sequence, "note": ""}
-                 for t in self._themes_for_season(at, Season(0, 1))],
+                 for t in at.themes],
                 f"animethemes:{at.slug}",
             )
         return [], "none"
@@ -619,6 +663,7 @@ class Orchestrator:
 
         # ---- 4. 逐条匹配
         for subject, bucket in picked:
+            self._check_cancelled()
             m = self._match_anime(subject, bucket, pool, season)
             if m.at_anime is None:
                 rep.unmatched.append(m)
@@ -645,6 +690,7 @@ class Orchestrator:
         # 教训：换了主数据源之后，「什么算匹配上」的判据也要跟着改 ——
         # AnimeThemes 匹配不上 ≠ 这部番没有曲目。
         for m in list(rep.matched) + list(rep.unmatched):
+            self._check_cancelled()
             at = m.at_anime
             themes, source = self._collect_themes(m.subject_names, at)
             if source.startswith("wikipedia:"):
@@ -687,7 +733,7 @@ class Orchestrator:
             for t in themes:
                 if not t.get("song_title"):
                     continue
-                self.store.upsert_theme(anime_id, Theme(
+                if not self._save_fetched_theme(anime_id, Theme(
                     anime_id=anime_id, kind=t["kind"],
                     song_title=t["song_title"],
                     artists=t.get("artists") or [],
@@ -696,7 +742,8 @@ class Orchestrator:
                     origin=(Origin.ANIMETHEMES
                             if source.startswith("animethemes") else Origin.SEARCH),
                     included=True, note=t.get("note") or "",
-                ))
+                )):
+                    continue
                 written += 1
                 wrote += 1
             # 数「真的写进去了曲目」的番，而不是「匹配上了的番」：
@@ -786,6 +833,7 @@ class Orchestrator:
         written = 0
         with_themes = 0
         for a in animes:
+            self._check_cancelled()
             anime_id = self.store.upsert_anime(sid, Anime(
                 season_key=season.key,
                 title_romaji=a.name,
@@ -800,11 +848,12 @@ class Orchestrator:
             for t in a.themes:
                 if not t.song_title:
                     continue
-                self.store.upsert_theme(anime_id, Theme(
+                if not self._save_fetched_theme(anime_id, Theme(
                     anime_id=anime_id, kind=t.kind, song_title=t.song_title,
                     artists=t.artists, sequence=t.sequence, source="animethemes",
                     origin=Origin.ANIMETHEMES, included=True,
-                ))
+                )):
+                    continue
                 written += 1
                 wrote += 1
             if wrote:
@@ -860,6 +909,7 @@ class Orchestrator:
         written = 0
         with_themes = 0
         for i, a in enumerate(animes, 1):
+            self._check_cancelled()
             name = a["title_cn"] or a["title_jp"] or a["title_romaji"] or "?"
             # 每部都报进度：维基限速 1 请求/秒，几部番就是几十秒 ——
             # 不报进度的话用户只会觉得"卡住了"。
@@ -874,7 +924,7 @@ class Orchestrator:
             for t in themes:
                 if not t.get("song_title"):
                     continue
-                self.store.upsert_theme(a["id"], Theme(
+                if not self._save_fetched_theme(a["id"], Theme(
                     anime_id=a["id"], kind=t["kind"],
                     song_title=t["song_title"],
                     artists=t.get("artists") or [],
@@ -883,7 +933,8 @@ class Orchestrator:
                     origin=(Origin.ANIMETHEMES
                             if source.startswith("animethemes") else Origin.SEARCH),
                     included=True, note=t.get("note") or "",
-                ))
+                )):
+                    continue
                 written += 1
                 wrote += 1
             if wrote:
@@ -929,6 +980,7 @@ class Orchestrator:
                 self._anilist_source = AniListSource(
                     cache_ttl=self._anilist_ttl, **self._http_kw)
             try:
+                self._anilist_source.http.check_cancelled = self._check_cancelled
                 self._at_pool_by_season[key] = self._anilist_source.fetch_season(
                     season, max_pages=2
                 )
@@ -1139,17 +1191,6 @@ class Orchestrator:
             best *= 0.98
         return best
 
-    @staticmethod
-    def _themes_for_season(at: AtAnime, season: Season):
-        """二次过滤：只收属于目标季度的 theme（§5.3.5）。
-
-        AnimeThemes 的 season 字段是 AnimeThemes 侧的季度，
-        和我们的目标季度可能不一致（年番跨季），因此按名称兜底：
-        若 at.season 与目标不符但确实是从标题搜索找回来的，
-        仍保留（因为调用方已确认是这部番）。
-        """
-        return at.themes
-
     # ================================================================ 匹配
 
     def match_season(self, season: Season, retry_missing: bool = False) -> MatchReport:
@@ -1168,10 +1209,20 @@ class Orchestrator:
             self.progress(f"待匹配 {len(todo)} / 共 {len(themes)} 条 theme")
 
         for row in todo:
+            self._check_cancelled()
             self._match_one(row, sid, rep)
 
-        # 统计
-        summary = self.store.decision_summary(sid)
+        # 旧实现把全季度历史结果除以本次 searched，增量运行可能超过100%。
+        # 从实际落库结果按本次范围计数；搜索全失败时旧 missing 决策仍在，不能算本次结果。
+        failed_ids = {d["theme_id"] for d in rep.details if d.get("status") == "search_failed"}
+        decisions = self.store.decision_map(sid)
+        summary: dict[str, int] = {}
+        for row in todo:
+            tid = row["id"]
+            if tid not in failed_ids and tid in decisions:
+                status = decisions[tid]["status"]
+                summary[status] = summary.get(status, 0) + 1
+        rep.searched = sum(summary.values())
         rep.auto = summary.get(DecisionStatus.AUTO, 0)
         rep.pending_review = summary.get(DecisionStatus.PENDING_REVIEW, 0)
         rep.missing_source = summary.get(DecisionStatus.MISSING_SOURCE, 0)
@@ -1180,7 +1231,7 @@ class Orchestrator:
 
         self.store.set_stage(sid, Stage.MATCH, StageStatus.CONFIRMED, confirmed=True)
         self.progress(
-            f"完成：自动 {rep.auto} · 待审核 {rep.pending_review} · "
+            f"本次完成：自动 {rep.auto} · 待审核 {rep.pending_review} · "
             f"未收录 {rep.missing_source} · 未上架 {rep.missing_netease} · "
             f"匹配不上 {rep.missing_match}"
         )
@@ -1218,6 +1269,7 @@ class Orchestrator:
         search_failed = 0
 
         for q, why in zip(plan.queries, plan.reasons):
+            self._check_cancelled()
             try:
                 cands = self.search.search(q, limit=self.config.match.search_limit)
             except Exception as e:  # noqa: BLE001
@@ -1315,7 +1367,9 @@ class Orchestrator:
                                 "detail": best_detail})
             return
 
-        cls = scorer.classify(best["score"])
+        cls = scorer.classify(best["score"],
+                              auto_threshold=self.config.match.auto_threshold,
+                              review_threshold=self.config.match.review_threshold)
         if cls == "auto":
             status = DecisionStatus.AUTO
             rep.auto += 1
@@ -1361,6 +1415,7 @@ class Orchestrator:
         stat = {"checked": 0, "title": 0, "artist": 0, "anime": 0}
 
         for row in self.store.theme_list(sid):
+            self._check_cancelled()
             d = decisions.get(row["id"])
             if not d or not d["chosen_candidate_id"]:
                 continue
@@ -1536,204 +1591,167 @@ class Orchestrator:
             })
         return out
 
-    def push_season(
-        self,
-        season: Season,
-        collector=None,
-        *,
-        dry_run: bool = False,
-        limit: int | None = None,
-        progress: Progress | None = None,
-    ) -> PushReport:
-        """把本季确认过的歌推送到对应季度歌单。
-
-        三条不可退让的原则：
-
-        **① 幂等靠客户端确认，不靠我们自己的台账。**
-        `pushed` 表只是「上次推过」的备忘录；真正的判据是
-        `add_to_playlist` 内部的歌单读取 —— 用户可能手动删过歌，
-        台账说推过、实际不在，那就是漏推。
-
-        **② 写操作绝不假装成功。**
-        `add_to_playlist` 返回 True 的含义被钉死为
-        「已经在歌单里」或「回查确实看到了」。这里不再放宽。
-
-        **③ 失败要逐条说清原因。**
-        `failed` 里每项都带 `error`（含逐候选的 dispatch 结论与回查结论），
-        界面直接展示，不糊成一句「部分失败」。
-
-        **④ 客户端没了就中止整批，不逐首空试。**（实测踩过的坑）
-        只在循环**前**查一次 `health()` 是不够的：用户中途关掉客户端
-        （或它自己崩了）之后，剩下的每一首都会各自失败一次 —— 40 首就是
-        40 条「失败」+ 每首一次 `confirm_timeout≈3s` 的回查轮询，而且报告
-        看起来像「40 首歌各自有问题」，把用户指到完全错误的方向去。
-        所以循环里要复检，但要**分清两种失败**：
-            · 这首歌自己的问题（回查没看到 / 没上架）→ 继续下一首；
-            · 客户端级故障（端口关了 / CDP 连不上 / 读不到 store）→ 中止整批，
-              剩下的记进 `rep.untried`（未尝试），不是「失败」。
-        判据只用 `health()`，**不看异常类型**：真实的 `add_to_playlist` 会把
-        CDP/端口故障自己吞掉、转成 `last_write_error` + 返回 False
-        （见 `desktop_cdp._write_fail`），编排层手上只有 False，靠异常类型判不出来。
-        复检只在**每 `PUSH_HEALTH_RECHECK_EVERY` 首之前**和**每次失败之后**做：
-        一次 health 是 4 次左右 CDP 往返，每首都查会把 1 首/秒变成 1 首/好几秒。
-        """
-        say = progress or self.progress
-        rep = PushReport(season=season)
-        rep.dry_run = dry_run
-        rep.playlist = constants.playlist_name(season.year, season.quarter)
+    def build_push_plan(self, season: Season, *, selections=None, limit: int | None = None) -> PushPlan:
+        """GUI传当前全量选择，CLI读取保存选择；空列表明确表示不推。"""
+        if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0):
+            raise ValueError("limit 必须是正整数或 None")
         sid = self.store.get_season_id(season.year, season.quarter)
-
-        items = self.pushable(season)
-        if limit:
+        available = self.pushable(season)
+        by_pair = {(r["theme_id"], r["song_id"]): r for r in available}
+        default = constants.playlist_name(season.year, season.quarter)
+        if selections is None:
+            saved = self.store.push_selection_rows(sid)
+            by_theme = {(r["theme_id"], r["netease_song_id"]): r for r in saved if r["theme_id"] is not None}
+            unbound = {r["netease_song_id"]: r for r in saved if r["theme_id"] is None}
+            selections = []
+            for r in available:
+                choice = by_theme.get((r["theme_id"], r["song_id"])) or unbound.get(r["song_id"]) or {}
+                if choice and choice["netease_song_id"] != r["song_id"]:
+                    choice = {}
+                selections.append({**choice, "theme_id": r["theme_id"], "song_id": r["song_id"]})
+        items = []
+        seen = set()
+        for choice in selections:
+            if not choice.get("included", True):
+                continue
+            song_id = str(choice.get("song_id") or choice.get("netease_song_id") or "").strip()
+            tid = choice.get("theme_id")
+            row = by_pair.get((tid, song_id))
+            if tid is None:
+                row = next((r for r in available if r["song_id"] == song_id), None)
+            if row is None:
+                continue
+            target = str(choice.get("playlist") or "").strip() or default
+            key = (target, song_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            items.append(PushPlanItem(theme_id=row["theme_id"], song_id=song_id, playlist=target,
+                                      anime=row["anime"], kind=row["kind"], target_title=row["target_title"],
+                                      name=row["name"]))
+        if limit is not None:
             items = items[:limit]
-        if not items:
-            say("没有可推送的曲目（需要先有「自动通过」或「人工确认」的匹配）")
+        return PushPlan(season=season, items=tuple(items))
+
+    def push_season(self, season: Season, collector=None, *, dry_run: bool = False,
+                    limit: int | None = None, progress: Progress | None = None,
+                    should_stop=None) -> PushReport:
+        plan = self.build_push_plan(season, limit=limit)
+        return self.execute_push_plan(plan, collector, dry_run=dry_run,
+                                      progress=progress, should_stop=should_stop)
+
+    def execute_push_plan(self, plan: PushPlan, collector=None, *, dry_run: bool = False,
+                          should_stop=None, progress: Progress | None = None) -> PushReport:
+        """在每首开始前校验并可停止；已经开始的写入必须完成回查与记账。"""
+        say = progress or self.progress
+        stop = should_stop or (lambda: False)
+        targets = list(dict.fromkeys(it.playlist for it in plan.items))
+        rep = PushReport(season=plan.season, dry_run=dry_run,
+                         playlist=targets[0] if len(targets) == 1 else
+                         constants.playlist_name(plan.season.year, plan.season.quarter) if not targets else "")
+        sid = self.store.get_season_id(plan.season.year, plan.season.quarter)
+
+        def result(it, status, *, note="", error=""):
+            return PushItem(theme_id=it.theme_id, song_id=it.song_id, playlist=it.playlist,
+                            anime=it.anime, kind=it.kind, target_title=it.target_title,
+                            name=it.name, status=status, note=note, error=error)
+
+        def remaining(start, why, *, stopped=False):
+            rep.untried = [result(it, "pending", note=f"未尝试：{why}") for it in plan.items[start:]]
+            rep.stopped = stopped
+            say(rep.summary())
             return rep
 
-        def untried(rest: list[dict], why: str) -> list[PushItem]:
-            """把「根本没试过」的曲目记成 `pending`（未尝试），而不是失败。"""
-            return [
-                PushItem(
-                    theme_id=it["theme_id"], anime=it["anime"], kind=it["kind"],
-                    target_title=it["target_title"], song_id=it["song_id"],
-                    name=it["name"], status="pending", note=f"未尝试：{why}",
-                )
-                for it in rest
-            ]
+        def current(it):
+            return any(r["theme_id"] == it.theme_id and r["song_id"] == it.song_id
+                       for r in self.pushable(plan.season))
 
-        if dry_run:
-            for it in items:
-                rep.items.append(PushItem(
-                    theme_id=it["theme_id"], anime=it["anime"], kind=it["kind"],
-                    target_title=it["target_title"], song_id=it["song_id"],
-                    name=it["name"], status="pending", note="试运行，未写入",
-                ))
-            say(f"试运行：将推送 {len(items)} 首到「{rep.playlist}」")
-            return rep
-
-        if collector is None:
-            from .collector.desktop_cdp import DesktopCDPCollector
-
-            collector = DesktopCDPCollector(self.config.netease.debug_port)
-
-        st = collector.health()
-        if not st.ok:
-            rep.fatal = st.detail
-            rep.untried = untried(items, "客户端不可用")
-            say(f"客户端不可用：{st.detail}")
-            return rep
-
-        # ---- 准备歌单（存在就复用；不存在才创建）
-        say(f"准备歌单「{rep.playlist}」…")
-        try:
-            existed = collector.find_playlist(rep.playlist)
-            ref = collector.ensure_playlist(rep.playlist)
-            rep.playlist_id = getattr(ref, "netease_id", None)
-            rep.playlist_created = existed is None
-            self.store.save_playlist(rep.playlist, rep.playlist_id, sid)
-            say(f"  歌单 {'已存在，复用' if existed else '已创建'}（id={rep.playlist_id}）")
-        except Exception as e:  # noqa: BLE001
-            rep.fatal = f"准备歌单失败：{type(e).__name__}: {e}"
-            rep.untried = untried(items, "歌单没准备好，一首都没试")
-            say(rep.fatal)
-            return rep
-
-        # ---- 逐首推送
-        total = len(items)
-        try:
-            from .collector.desktop_cdp import WRITE_ACTION_ADDED
-        except ImportError:  # pragma: no cover - 只读环境
-            WRITE_ACTION_ADDED = None
-
-        aborted = ""        # 非空 = 客户端级故障，整批中止
-
-        def client_gone() -> str:
-            """复检客户端；不可用就返回原因（写进 `rep.fatal`），可用返回 ""。
-
-            连 `health()` 自己抛异常也算「客户端没了」：collector 都坏了，
-            这个批量再往下推没有意义。
-            """
+        def health_error():
             try:
-                st = collector.health()
-            except Exception as e:  # noqa: BLE001
-                return f"客户端健康检查本身失败（{type(e).__name__}: {e}）"
-            if st.ok:
-                return ""
-            return st.detail or "客户端不可用（health 没给原因）"
+                status = collector.health()
+                return "" if status.ok else status.detail or "客户端不可用"
+            except Exception as e:
+                return f"客户端健康检查失败：{type(e).__name__}: {e}"
 
-        for n, it in enumerate(items, 1):
-            song_id = it["song_id"]
-
-            # 主动复检：客户端可能在两首之间悄悄退出，而**这一首未必失败**
-            # （歌单成员有 2 秒缓存，缓存还答得上来）。这个探测就是给这种情况兜底，
-            # 免得白白浪费一次 3 秒的回查轮询。
-            if n > 1 and (n - 1) % PUSH_HEALTH_RECHECK_EVERY == 0:
-                aborted = client_gone()
-                if aborted:
-                    say(f"  客户端在第 {n}/{total} 首之前就不可用了：{aborted} —— 中止本批")
-                    break
-
-            was = self.store.is_pushed(rep.playlist, song_id)
+        refs = {}
+        checked = False
+        for index, it in enumerate(plan.items):
+            if stop():
+                return remaining(index, "用户要求停止", stopped=True)
+            if not current(it):
+                rep.items.append(result(it, "skipped", note="计划已过期，请重新匹配或纳入曲目"))
+                continue
+            if dry_run:
+                rep.items.append(result(it, "pending", note="试运行，未写入"))
+                continue
+            if collector is None:
+                from .collector.desktop_cdp import DesktopCDPCollector
+                collector = DesktopCDPCollector(self.config.netease.debug_port)
+            if not checked or index % PUSH_HEALTH_RECHECK_EVERY == 0:
+                error = health_error()
+                if error:
+                    rep.fatal = f"客户端不可用，已中止本批：{error}"
+                    return remaining(index, "客户端不可用")
+                checked = True
+            if stop():
+                return remaining(index, "用户要求停止", stopped=True)
+            if it.playlist not in refs:
+                say(f"准备歌单「{it.playlist}」…")
+                try:
+                    existed = collector.find_playlist(it.playlist)
+                    if stop():
+                        return remaining(index, "用户要求停止", stopped=True)
+                    ref = collector.ensure_playlist(it.playlist)
+                    refs[it.playlist] = ref
+                    playlist_id = getattr(ref, "netease_id", None)
+                    self.store.save_playlist(it.playlist, playlist_id, sid)
+                    rep.playlists[it.playlist] = {"id": playlist_id, "created": existed is None}
+                    rep.playlist_created |= existed is None
+                    if rep.playlist:
+                        rep.playlist_id = playlist_id
+                except Exception as e:
+                    rep.fatal = f"准备歌单失败：{type(e).__name__}: {e}"
+                    return remaining(index, "歌单未准备好")
+            if stop():
+                return remaining(index, "用户要求停止", stopped=True)
+            # 歌单准备过程中决策也可能改变，不得以旧计划替换成另一首后继续写。
+            if not current(it):
+                rep.items.append(result(it, "skipped", note="计划已过期，请重新匹配或纳入曲目"))
+                continue
+            was = self.store.is_pushed(it.playlist, it.song_id)
             try:
-                ok = collector.add_to_playlist(song_id, ref)
-            except Exception as e:  # noqa: BLE001
-                ok = False
-                err = f"{type(e).__name__}: {e}"
+                ok = collector.add_to_playlist(it.song_id, refs[it.playlist])
+            except Exception as e:
+                ok, error = False, f"{type(e).__name__}: {e}"
             else:
-                err = getattr(collector, "last_write_error", "") or ""
-
+                error = getattr(collector, "last_write_error", "") or ""
             note = getattr(collector, "last_write_note", "") or ""
-            action = getattr(collector, "last_write_action", None)
-
             if ok:
-                self.store.mark_pushed(rep.playlist, song_id, it["theme_id"])
-                # ⚠️ 「本次新推」的判据是 **collector 实际做了什么**，
-                # 不是我们自己的台账。
-                #
-                # 实测踩过的坑：歌单里本来就有这首歌时，collector 会跳过
-                # （返回 True，零 dispatch），而我们的台账里没有 → 之前就
-                # 报成了「新推送」。报告说推了一首，实际一个写入请求都没发。
-                if action is None:
-                    # 外部 collector 没有这个字段 → 退回台账判断（次优但安全）
-                    status = "existed" if was else "pushed"
-                else:
-                    status = "pushed" if action == WRITE_ACTION_ADDED else "existed"
+                self.store.mark_pushed(it.playlist, it.song_id, it.theme_id)
+                action = getattr(collector, "last_write_action", None)
+                from .collector.desktop_cdp import WRITE_ACTION_ADDED
+                status = ("existed" if was else "pushed") if action is None else (
+                    "pushed" if action == WRITE_ACTION_ADDED else "existed")
             else:
                 status = "failed"
-            rep.items.append(PushItem(
-                theme_id=it["theme_id"], anime=it["anime"], kind=it["kind"],
-                target_title=it["target_title"], song_id=song_id, name=it["name"],
-                status=status, note=note, error="" if ok else err,
-            ))
-            mark = {"pushed": "＋", "existed": "＝", "failed": "✗"}[status]
-            say(f"  [{n}/{total}] {mark} {it['name'][:28]}"
-                + (f"  {err[:60]}" if not ok else ""))
-
+            rep.items.append(result(it, status, note=note, error="" if ok else error))
+            say(f"  [{index + 1}/{len(plan.items)}] {it.playlist} · {it.name[:28]}：{status}"
+                + (f"  {error[:100]}" if not ok else ""))
             if not ok:
-                # 失败之后才值得花一次 health：这一步就是「这首歌不行」
-                # 与「客户端没了」的分界点。分不出来的话，我们会把
-                # 一次客户端掉线报成 N 次「歌曲失败」。
-                aborted = client_gone()
-                if aborted:
-                    say(f"  客户端在第 {n}/{total} 首时不可用：{aborted} —— 中止本批，剩余不再逐首试")
-                    break
-
-        if aborted:
-            rep.untried = untried(items[len(rep.items):], "客户端不可用，本批已中止")
-            rep.fatal = (
-                f"客户端在 {len(rep.items)}/{total} 首时不可用，已中止本批"
-                f"（不再逐首空试）：{aborted}"
-                f"；还剩 {len(rep.untried)} 首未尝试 —— 客户端恢复后重跑即可，"
-                f"已推的不会重复（幂等靠歌单回查）"
-            )
-            say(f"推送中止：{rep.fatal}")
-            return rep
-
-        say(f"推送完成：{rep.summary()}")
+                error = health_error()
+                if error:
+                    rep.fatal = f"客户端不可用，已中止本批：{error}"
+                    return remaining(index + 1, "客户端不可用")
+        if dry_run:
+            say(f"试运行：将推送 {len([i for i in rep.items if i.status == 'pending'])} 首到 {len(targets)} 个歌单（未写入）")
+        else:
+            say(f"推送完成：{rep.summary()}")
         return rep
 
     def describe_push(self, rep: PushReport) -> list[str]:
         """把 PushReport 变成可直接打印的行。"""
+        if rep.stopped:
+            return [rep.summary()] + [f"  未尝试：{it.playlist} · {it.name}" for it in rep.untried]
         if rep.fatal:
             lines = [f"推送中止：{rep.fatal}"]
             if rep.untried and rep.items:
@@ -1753,12 +1771,13 @@ class Orchestrator:
             return lines
         # ⚠️ 试运行时**从未检查过**歌单是否存在，就不能说「复用已有」——
         # 声称自己知道实际不知道的事，比不说更糟。
-        head = f"歌单「{rep.playlist}」"
+        targets = set(rep.playlists) | {it.playlist for it in rep.items + rep.untried if it.playlist}
+        head = f"歌单「{rep.playlist}」" if rep.playlist else f"多个目标歌单（{len(targets)}个）"
         if rep.playlist_id:
             head += f"（id={rep.playlist_id}）"
         if rep.dry_run:
             head += "　【试运行，未检查歌单是否存在】"
-        else:
+        elif rep.playlist:
             head += "，本次新建" if rep.playlist_created else "，复用已有"
         lines = [
             head,
@@ -1766,7 +1785,7 @@ class Orchestrator:
         ]
         if rep.dry_run:
             for it in rep.items:
-                lines.append(f"  · {it.anime} {it.kind} — {it.target_title} → {it.name}")
+                lines.append(f"  · {it.playlist} · {it.anime} {it.kind} — {it.target_title} → {it.name}")
             return lines
 
         fails = rep.failed

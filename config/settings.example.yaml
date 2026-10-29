@@ -20,6 +20,7 @@
 netease:
   client_path: ''
   debug_port: 9222
+  # 以下两项仅保留旧配置兼容，尚未接入业务；修改它们不会生效。
   rate_limit_rps: 1.0
   playlist_name_template: '{yy}年{m}月'
 
@@ -36,11 +37,11 @@ bangumi:
   - api_tab
   - dom
   page_size: 100
-  only_target_season: true
+  only_target_season: true  # 兼容保留，尚未接入；跨季纳入由 include_cross_season 控制
   include_cross_season: true
 
 fetch:
-  source_priority:
+  source_priority:  # 兼容保留，尚未接入；曲目仍固定为日文维基主源、AnimeThemes 回退
   - bangumi
   - animethemes
   - anilist

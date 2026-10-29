@@ -8,12 +8,21 @@ pydantic_core / annotated-types / typing-extensions），
 from __future__ import annotations
 
 import os
+import math
 from dataclasses import dataclass, field, fields
 from typing import Any
 
 import yaml
 
 from . import constants
+
+
+def validate_match_thresholds(auto_threshold: float, review_threshold: float) -> None:
+    values = (auto_threshold, review_threshold)
+    if any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) for v in values):
+        raise ValueError("匹配阈值必须是有限数值")
+    if not 0 <= review_threshold <= auto_threshold <= 1:
+        raise ValueError("匹配阈值必须满足 0 <= review_threshold <= auto_threshold <= 1")
 
 
 @dataclass
@@ -124,6 +133,12 @@ class MatchConfig:
     # 「仅艺人」查询会返回该艺人的多首歌，取宽一点让打分器挑
     search_limit: int = 15
 
+    def validate(self) -> None:
+        validate_match_thresholds(self.auto_threshold, self.review_threshold)
+
+    def __post_init__(self) -> None:
+        self.validate()
+
 
 @dataclass
 class Config:
@@ -158,6 +173,7 @@ class Config:
             for k, v in data.items():
                 if k in valid and v is not None:
                     setattr(section, k, v)
+        cfg.match.validate()
         return cfg
 
     def save(self, path: str | None = None) -> None:

@@ -348,6 +348,7 @@ class HttpClient:
         #: 自己取快照差值，或者直接用一个新的客户端（编排层是后者）。
         self.stats = RequestStats()
         self._on_event = on_event
+        self.check_cancelled = None
 
         # ---- HTTP 429（限流）的策略，见 `constants` 里那一节
         #: **本步为限流等待的总预算（秒）**。为什么必须有它而不是「单次上限」：
@@ -437,6 +438,8 @@ class HttpClient:
         use_cache: bool = False,
         retries: int | None = None,
     ) -> Response:
+        if self.check_cancelled is not None:
+            self.check_cancelled()
         h = {
             "User-Agent": self.user_agent,
             "Accept-Encoding": "gzip",
@@ -481,9 +484,17 @@ class HttpClient:
         #: 这个 URL 已经为 429 等过几次。**与 `attempts` 分开计**：
         #: 429 是服务端在限流，不该和「网络抖动」共用同一份重试预算。
         rl_used = 0
-
-        for i in range(attempts + 1):
+        i = 0
+        retry_kind = None
+        while True:
             self.stats.limiter_seconds += self.limiter.wait(host)
+            if self.check_cancelled is not None:
+                self.check_cancelled()
+            # 等待完成且真正开始下一次发送时才计重试，不能把「准备重试」当作请求。
+            if retry_kind == "rate_limit":
+                self.stats.rate_limit_retries += 1
+            elif retry_kind == "network":
+                self.stats.retried += 1
             self.stats.requests += 1
             t0 = time.monotonic()
             req = urllib.request.Request(url, data=data, headers=h, method=method)
@@ -538,14 +549,10 @@ class HttpClient:
                     # 一条 URL 只在**彻底没过去**时才算一次事件。
                     left = max(0.0, self.rate_limit_wait_budget
                                - self.stats.rate_limit_wait)
+                    nap = constants.RATE_LIMIT_DEFAULT_WAIT if wait is None else wait
                     if rl_used < self.rate_limit_retries \
-                            and host not in self._rl_tripped and left > 0:
+                            and host not in self._rl_tripped and nap <= left:
                         rl_used += 1
-                        # 它确实又发了一次请求，所以必须记账 —— 不计入 `retried`
-                        # （那是退避专用的），但恒等式里不能少这一项。
-                        self.stats.rate_limit_retries += 1
-                        nap = min(constants.RATE_LIMIT_DEFAULT_WAIT if wait is None
-                                  else wait, left)
                         self.stats.rate_limit_wait += nap
                         asked = (f"服务端 Retry-After={wait:.0f} 秒"
                                  if wait is not None else "服务端没给 Retry-After")
@@ -554,12 +561,13 @@ class HttpClient:
                                    f"{self.rate_limit_retries} 次；本步剩余预算 "
                                    f"{left - nap:.1f} 秒）")
                         time.sleep(nap)
+                        retry_kind = "rate_limit"
                         continue
-                    if left <= 0 and not self._rl_budget_spent:
+                    if nap > left and not self._rl_budget_spent:
                         self._rl_budget_spent = True
                         self._emit(
                             f"本步为限流等待的预算（{self.rate_limit_wait_budget:.0f} 秒）"
-                            f"已用完 —— 之后遇到 429 不再等待，直接放弃该请求")
+                            f"不足以满足服务端等待要求 —— 放弃本请求，不截短等待后提前重试")
 
                     tripped = self._see_429(host)
                     self.stats.failed += 1
@@ -586,10 +594,13 @@ class HttpClient:
 
             if i < attempts:
                 # 指数退避 + 抖动（只管网络抖动与 5xx；429 在上面单独处理）
-                self.stats.retried += 1
                 nap = min(8.0, (2.0**i) * 0.5) * (0.7 + random.random() * 0.6)
                 self.stats.backoff += nap
                 time.sleep(nap)
+                i += 1
+                retry_kind = "network"
+                continue
+            break
 
         self.stats.failed += 1
         # ⚠️ `status` 必须带上来：`last` 是最后一次的异常，而重试耗尽时

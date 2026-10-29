@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from . import constants
+from .config import validate_match_thresholds
 from .normalize import (
     artist_romaji_similarity,
     expand_artists,
@@ -264,11 +265,13 @@ def score(cand: dict, target: Target, prefer_full_size: bool = True) -> Scored:
     )
 
 
-def classify(value: float) -> str:
+def classify(value: float, *, auto_threshold: float = constants.AUTO_THRESHOLD,
+             review_threshold: float = constants.REVIEW_THRESHOLD) -> str:
     """阈值分档（§6.3）。"""
-    if value >= constants.AUTO_THRESHOLD:
+    validate_match_thresholds(auto_threshold, review_threshold)
+    if value >= auto_threshold:
         return "auto"
-    if value >= constants.REVIEW_THRESHOLD:
+    if value >= review_threshold:
         return "pending_review"
     return "low"
 

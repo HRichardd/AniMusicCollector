@@ -75,7 +75,7 @@ class TestGuiFlow(unittest.TestCase):
                 os.remove(self.db + ext)
         self.store = Store(self.db)
         self.sess = WizardSession(store=self.store, season=Season.parse("2026Q4"))
-        self.win = MainWindow(self.sess)
+        self.win = MainWindow(self.sess, probe_enabled=False)
         self._pump()
 
     def tearDown(self):

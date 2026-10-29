@@ -6,8 +6,7 @@
     所以这里直接用 AnimeThemes 当季全量（38 部 × ~2 条 = 76 条 theme）
     构造输入 —— 样本更多，结论更可靠，而且不依赖浏览器。
 
-    因为目标是「AnimeThemes 的曲目 → 网易云的正确歌曲」，
-    AnimeThemes 侧的曲名/艺人是**真值**，所以能客观判断匹配对不对。
+    输出是算法分档与候选覆盖率；没有逐首人工核验，不能称为准确率。
 
 用法：
     python tools/measure_accuracy.py --season 2026Q4            # 全量
@@ -89,7 +88,6 @@ def seed(store: Store, sid: int, season: Season, limit: int | None, verbose: boo
     if limit:
         animes = animes[:limit]
 
-    n = 0
     for a in animes:
         anime_id = store.upsert_anime(
             sid,
@@ -120,16 +118,16 @@ def seed(store: Store, sid: int, season: Season, limit: int | None, verbose: boo
                     included=True,
                 ),
             )
-            n += 1
         if verbose:
             jp = native_by_romaji.get(a.name) or "—"
             print(f"    seed {a.name[:42]:<44} jp={jp[:18]:<20} {len(a.themes)} themes")
-    return n
+    # 重复来源条目可能合并成一行；分母必须是实际参与测量的库内曲目数。
+    return len(store.theme_list(sid))
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--season", default="2026Q4")
+    ap.add_argument("--season", default=Season.current().key)
     ap.add_argument("--limit", type=int, default=None, help="只取前 N 部番（小样本快跑）")
     ap.add_argument("--db", default=None, help="DB 路径，默认 data/accuracy_test.db")
     ap.add_argument("--quiet", action="store_true")
@@ -167,7 +165,7 @@ def main() -> int:
 
     print()
     print("=" * 68)
-    print("  匹配结果")
+    print("  本次匹配结果（自动通过率不等于人工核验准确率）")
     print("=" * 68)
     print(f"  theme 总数            {rep.themes_total}")
     print(f"  参与匹配              {rep.searched}")

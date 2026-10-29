@@ -2148,6 +2148,11 @@ class DesktopCDPCollector:
                 f"—— 无法核对曲目（歌单来源：{source}）",
                 False, 0, None, )
         songs = songs_from_playlist_entry(entry, state, index=self._song_index_of(state))
+        if entry.get("track_count") == 0 and not wp.contains_song(songs, song_id):
+            # 客户端 store 可能尚未刷新，0 不足以证明服务端为空；交给 web API 核对。
+            return wp.Membership(
+                None, "store 自报 trackCount=0，但可能尚未加载或刷新，需要 web API 核对",
+                False, 0, 0)
         return wp.check_membership(songs, song_id,
                                    declared_count=entry.get("track_count"),
                                    entries=len(entry.get("tracks") or []),

@@ -70,6 +70,7 @@ class EnvPathsTestBase(unittest.TestCase):
         self.base = os.path.join(self.home, "profiles")
         os.makedirs(self.base, exist_ok=True)
         self._panels: list = []
+        self._stores: list = []
         self.logs: list[str] = []
         # 不在测试里起探测线程（这个项目吃过线程/GC 的亏）
         self._probe_patch = mock.patch.object(mw.EnvPanel, "probe", lambda self: None)
@@ -77,6 +78,10 @@ class EnvPathsTestBase(unittest.TestCase):
 
     def tearDown(self):
         self._probe_patch.stop()
+        # 独立 EnvPanel 没有 MainWindow.closeEvent 替它关闭会话。
+        for store in self._stores:
+            store.close()
+        self._stores.clear()
         for p in self._panels:
             p.setParent(None)
             p.deleteLater()
@@ -94,11 +99,13 @@ class EnvPathsTestBase(unittest.TestCase):
             self.app.processEvents()
 
     def panel(self) -> "mw.EnvPanel":
+        store = Store(":memory:")
+        self._stores.append(store)
         sess = WizardSession(
-            config=Config.load(), store=Store(":memory:"),
+            config=Config.load(), store=store,
             season=Season.parse("2026Q4"), aliases=AliasTable(),
         )
-        p = mw.EnvPanel(sess)
+        p = mw.EnvPanel(sess, probe_enabled=False)
         self._panels.append(p)
         p.log.connect(self.logs.append)
         self._pump()
@@ -186,6 +193,43 @@ class TestDefaults(EnvPathsTestBase):
 
 
 class TestPersistence(EnvPathsTestBase):
+    def test_saved_ports_are_loaded_and_used_by_launch_arguments(self):
+        data = self.disk()
+        data["netease"]["debug_port"] = 19322
+        data["browser"]["debug_port"] = 19323
+        self.write_disk(data)
+        p = self.panel()
+        self.assertEqual(p.netease.port_edit.text(), "19322")
+        self.assertEqual(p.browser.port_edit.text(), "19323")
+        self.assertIn("--remote-debugging-port=19322", p._netease_spec()[1])
+        self.assertIn("--remote-debugging-port=19323", p._browser_spec()[1])
+
+    def test_port_edit_persists_without_overwriting_other_settings(self):
+        p = self.panel()
+        data = self.disk()
+        data["browser"]["start_url"] = "https://example.invalid/keep"
+        self.write_disk(data)
+        p.session._orch = object()
+        p.browser.port_edit.setText("19323")
+        p.browser.port_edit.editingFinished.emit()
+        self.assertEqual(self.disk()["browser"]["debug_port"], 19323)
+        self.assertEqual(self.disk()["browser"]["start_url"], "https://example.invalid/keep")
+        self.assertEqual(p.session.config.browser.debug_port, 19323)
+        self.assertIsNone(p.session._orch)
+        reopened = self.panel()
+        self.assertEqual(reopened.browser.port_edit.text(), "19323")
+
+    def test_invalid_or_conflicting_port_restores_previous_value(self):
+        p = self.panel()
+        before = self.disk()
+        for text in ("abc", "0", "65536", "-1", str(p.session.config.browser.debug_port)):
+            with self.subTest(text=text):
+                p.netease.port_edit.setText(text)
+                p.netease.port_edit.editingFinished.emit()
+                self.assertEqual(p.netease.port_edit.text(), str(p.session.config.netease.debug_port))
+                self.assertEqual(self.disk(), before)
+        self.assertLogged("端口无效")
+
     def test_browse_fills_field_and_saves(self):
         p = self.panel()
         with mock.patch.object(QFileDialog, "getOpenFileName",
@@ -213,7 +257,9 @@ class TestPersistence(EnvPathsTestBase):
     def test_other_sections_survive(self):
         """写路径只能改这几个 key —— 用户开着程序时改过的其它项不能被冲掉。"""
         d = self.disk()
+        # 路径持久化只验证配置保留；阈值组合本身仍须通过领域校验。
         d["match"]["auto_threshold"] = 0.5
+        d["match"]["review_threshold"] = 0.4
         d["bangumi"]["uid"] = "1000001"
         self.write_disk(d)
         p = self.panel()
@@ -221,6 +267,7 @@ class TestPersistence(EnvPathsTestBase):
         p.netease.path_edit.editingFinished.emit()
         after = self.disk()
         self.assertEqual(after["match"]["auto_threshold"], 0.5)
+        self.assertEqual(after["match"]["review_threshold"], 0.4)
         self.assertEqual(after["bangumi"]["uid"], "1000001")
 
     def test_write_failure_is_reported_not_swallowed(self):

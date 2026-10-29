@@ -178,12 +178,14 @@ class TestSelfcheckCommand(unittest.TestCase):
     def test_selfcheck_exits_zero_with_marker(self):
         import contextlib
         import io
+        from unittest.mock import patch
 
         from animusic import cli
 
         buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
+        with patch("animusic.gui.main_window.ProbeWorker", side_effect=AssertionError("离线自检不应探测真实端口")) as probe, contextlib.redirect_stdout(buf):
             code = cli.main(["selfcheck"])
+        probe.assert_not_called()
         text = buf.getvalue()
 
         self.assertEqual(code, 0, f"selfcheck 退出码 {code}：\n{text}")

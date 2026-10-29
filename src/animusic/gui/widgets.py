@@ -337,6 +337,8 @@ class DictTableModel(QAbstractTableModel):
         if role == Qt.CheckStateRole and col.kind == "check":
             self._record(index.row(), row, col.key, row.get(col.key), bool(value))
             row[col.key] = bool(value)
+            if col.key == "included" and "theme_included" in row:
+                row["theme_included"] = bool(value)
             self.dataChanged.emit(index, index, [Qt.CheckStateRole, Qt.DisplayRole])
             return True
 
@@ -393,6 +395,15 @@ class DictTableModel(QAbstractTableModel):
 
     def remove_rows(self, idxs: list[int]) -> None:
         for i in sorted(set(idxs), reverse=True):
+            row = self.rows[i]
+            # 已保存的①②行只排除；物理移出模型会让保存端丢失用户意图。
+            if "included" in row and (row.get("theme_id") or
+                                       (row.get("anime_id") and "song_title" not in row)):
+                row["included"] = False
+                if "theme_included" in row:
+                    row["theme_included"] = False
+                self.dataChanged.emit(self.index(i, 0), self.index(i, len(self.columns) - 1))
+                continue
             self.beginRemoveRows(QModelIndex(), i, i)
             self.rows.pop(i)
             self.endRemoveRows()
@@ -429,6 +440,8 @@ class DictTableView(QTableView):
     def __init__(self, columns: list[Column], parent=None):
         super().__init__(parent)
         self.columns = columns
+        self.allow_add = True
+        self.add_handler = None
         self.setAlternatingRowColors(False)
         self.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.setSelectionMode(QAbstractItemView.ExtendedSelection)
@@ -507,7 +520,9 @@ class DictTableView(QTableView):
                 extra = dict(self._menu_builder(menu, row, idx.row()) or {})
                 if extra:
                     menu.addSeparator()
-            act_del = menu.addAction("删除此行")
+            saved = "included" in row and (row.get("theme_id") or
+                                             (row.get("anime_id") and "song_title" not in row))
+            act_del = menu.addAction("排除此行（保留历史）" if saved else "移除此行")
             act_excl = None
             if "included" in row:
                 act_excl = menu.addAction("从结果中排除（不删除）" if row.get("included") else "重新纳入")
@@ -516,7 +531,7 @@ class DictTableView(QTableView):
                 menu.addSeparator()
                 act_restore = menu.addAction("恢复为数据源值")
             menu.addSeparator()
-            act_add = menu.addAction("新增一行")
+            act_add = menu.addAction("新增一行") if self.allow_add else None
 
             chosen = menu.exec(e.globalPos())
             if chosen is None:
@@ -526,9 +541,14 @@ class DictTableView(QTableView):
             elif chosen == act_del:
                 self.model().remove_rows([idx.row()])
                 self.rows_changed.emit()
-                self.log.emit(f"已删除第 {idx.row() + 1} 行")
+                self.log.emit(f"已{'排除' if saved else '移除'}第 {idx.row() + 1} 行")
             elif act_excl is not None and chosen == act_excl:
                 row["included"] = not row.get("included")
+                if "theme_included" in row:
+                    row["theme_included"] = row["included"]
+                self.model().dataChanged.emit(self.model().index(idx.row(), 0),
+                                              self.model().index(idx.row(), len(self.columns) - 1))
+                self.rows_changed.emit()
                 self.log.emit(f"第 {idx.row() + 1} 行 included → {row['included']}")
             elif act_restore is not None and chosen == act_restore:
                 row["origin"] = "animethemes"
@@ -541,6 +561,8 @@ class DictTableView(QTableView):
             elif chosen == act_add:
                 self._add_row()
         else:
+            if not self.allow_add:
+                return
             act_add = menu.addAction("新增一行")
             if menu.exec(e.globalPos()) == act_add:
                 self._add_row()
@@ -551,11 +573,16 @@ class DictTableView(QTableView):
             if rows:
                 self.model().remove_rows(rows)
                 self.rows_changed.emit()
-                self.log.emit(f"已删除 {len(rows)} 行")
+                self.log.emit(f"已排除已有行或移除未保存行：{len(rows)} 行")
             return
         super().keyPressEvent(e)
 
     def _add_row(self) -> None:
+        if not self.allow_add:
+            return
+        if self.add_handler is not None:
+            self.add_handler()
+            return
         r = self.model().add_row()
         self.rows_changed.emit()
         self.log.emit(f"已新增第 {r + 1} 行 —— 请填写内容")

@@ -216,12 +216,14 @@ class Test429Policy(HttpCase):
         self.assertEqual(c.stats.rate_limit_wait, constants.RATE_LIMIT_DEFAULT_WAIT)
 
     def test_wait_is_limited_by_the_step_budget(self):
-        """服务端要求等 600 秒时按**本步预算**截断 —— 一步里干等 10 分钟没有意义。"""
+        """预算不足就直接放弃，不能截短服务端等待后提前重试。"""
         self.raises_429(600)
         c = HttpClient(rps=0, rate_limit_wait_budget=30.0)
         with self.assertRaises(RateLimited):
             c.get("https://ja.wikipedia.org/w/api.php?action=parse&page=X")
-        self.assertEqual(c.stats.rate_limit_wait, 30.0)
+        self.assertEqual(c.stats.rate_limit_wait, 0.0)
+        self.assertEqual(len(self.hits), 1)
+        self.assertEqual(c.stats.rate_limit_retries, 0)
 
     def test_budget_stops_runaway_waiting_when_429s_are_intermittent(self):
         """⚠️ 这条钉的是一个**比原问题更糟**的坑。
@@ -239,17 +241,17 @@ class Test429Policy(HttpCase):
         with self.assertRaises(RateLimited):
             c.get("https://ja.wikipedia.org/w/api.php?action=parse&page=A")
 
-        # 预算只有 10 秒，而服务端要 25 秒 → 只等 10 秒，然后放弃
-        self.assertEqual(c.stats.rate_limit_wait, 10.0)
-        self.assertEqual(self.sleeps, [10.0])
+        # 预算只有10秒，服务端要求25秒：不发送提前重试，也不浪费10秒等待。
+        self.assertEqual(c.stats.rate_limit_wait, 0.0)
+        self.assertEqual(self.sleeps, [])
 
         hits_before = len(self.hits)
         with self.assertRaises(RateLimited):
             c.get("https://ja.wikipedia.org/w/api.php?action=parse&page=B")
         self.assertEqual(len(self.hits) - hits_before, 1,
                          "预算用完后再遇到 429 应当**直接放弃**，不再重试")
-        self.assertEqual(c.stats.rate_limit_wait, 10.0, "不该再增加等待")
-        self.assertEqual(len([e for e in events if "已用完" in e]), 1,
+        self.assertEqual(c.stats.rate_limit_wait, 0.0, "不该再增加等待")
+        self.assertEqual(len([e for e in events if "不足" in e]), 1,
                          "预算用完只提示一次，不刷屏")
 
     def test_zero_retries_means_one_request(self):

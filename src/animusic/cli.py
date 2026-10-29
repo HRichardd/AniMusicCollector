@@ -276,7 +276,8 @@ def cmd_selfcheck(args) -> int:
         app.setStyleSheet(style.QSS)
         store = Store(":memory:")
         sess = WizardSession(store=store, season=Season.current(), aliases=AliasTable())
-        win = MainWindow(sess)
+        # 离线自检只构造与断言，不能启动CDP探测线程后又强制析构其父窗口。
+        win = MainWindow(sess, probe_enabled=False)
         win.close()                     # closeEvent 会停掉状态灯定时器
         # 当场析构，不留给 GC —— 这个项目已经因为「Qt 对象丢给 GC、在别的线程里
         # 析构」吃过一次间歇性崩溃（0xC0000409，见 HANDOFF §0）。
@@ -741,7 +742,7 @@ def cmd_match(args) -> int:
             traceback.print_exc()
         return 1
 
-    head("结果（关键指标）")
+    head("本次运行结果（仅统计本次实际保存的匹配结果）")
     out(f"  参与匹配的 theme     {rep.searched} / 共 {rep.themes_total}")
     out(f"  搜索次数             {rep.queries_used}")
     out("")
@@ -753,7 +754,7 @@ def cmd_match(args) -> int:
     out("")
     out(f"  ★ 自动通过率         {rep.auto_rate:.1%}",
         "green" if rep.auto_rate >= 0.5 else "yellow")
-    out(f"  ★ 可用率(自动+待审)  {rep.usable_rate:.1%}",
+    out(f"  ★ 候选可用率(自动+待审)  {rep.usable_rate:.1%}",
         "green" if rep.usable_rate >= 0.8 else "yellow")
     return 0
 

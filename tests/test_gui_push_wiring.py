@@ -45,12 +45,16 @@ from animusic.models import (  # noqa: E402
     ThemeKind,
 )
 from animusic.store import Store  # noqa: E402
+from animusic.config import Config
+from animusic.models import Candidate
+from animusic.orchestrator import Orchestrator
 
 _TMP = os.path.join(_ROOT, "data", "_test_tmp")
 
 #: 真实存在的 theme_id —— `pushed` 表对 `theme_id` 有**外键**，塞一个不存在的 id
 #: 会 `FOREIGN KEY constraint failed`。`setUp` 里会把它换成刚种下的那条。
 _THEME_ID: int | None = None
+_SONG_THEMES: dict[str, int] = {}
 
 
 # ---------------------------------------------------------------- 假 collector
@@ -119,7 +123,12 @@ class _FakeSession:
         self.season_id = store.get_season_id(2026, 4)
 
     def orchestrator(self):
-        raise AssertionError("E 组测试不该走到 orchestrator")
+        # 共用执行器必须在真实决策上复检，不能用任意song_id冒充可推歌曲。
+        orch = Orchestrator.__new__(Orchestrator)
+        orch.store = self.store
+        orch.config = Config()
+        orch.progress = lambda msg: None
+        return orch
 
 
 def _subject(store: Store, collector: FakeCollector):
@@ -145,7 +154,7 @@ def _subject(store: Store, collector: FakeCollector):
 
 def _row(song_id: str, name: str = "歌", playlist: str = "", **kw) -> dict:
     return {"song_id": song_id, "netease_song_id": song_id, "name": name,
-            "playlist": playlist, "theme_id": kw.pop("theme_id", _THEME_ID),
+            "playlist": playlist, "theme_id": kw.pop("theme_id", _SONG_THEMES.get(song_id, _THEME_ID)),
             "anime": kw.pop("anime", "番"), "kind": kw.pop("kind", "OP"), **kw}
 
 
@@ -193,6 +202,12 @@ class TestPushGroups(unittest.TestCase):
         _THEME_ID = self.store.upsert_theme(aid, Theme(
             anime_id=aid, kind=ThemeKind.OP, song_title="接线测试曲", artists=["A"],
             sequence=1, source="wikipedia", origin=Origin.BANGUMI))
+        _SONG_THEMES.clear()
+        for song in ("1", "2", "3", "501", "502", "503", "601", "602"):
+            tid = self.store.upsert_theme(aid, Theme(anime_id=aid, kind=ThemeKind.OP, song_title=f"歌{song}"))
+            cid = self.store.upsert_candidate(tid, Candidate(theme_id=tid, netease_song_id=song, name=f"歌{song}"))
+            self.store.set_decision(tid, "auto", cid)
+            _SONG_THEMES[song] = tid
 
     def tearDown(self):
         self.store.close()
@@ -272,8 +287,8 @@ class TestPushGroups(unittest.TestCase):
         col = FakeCollector()
         sub = _subject(self.store, col)
         sub._push_groups({"26年10月": [
-            {"song_id": "601", "name": "从 pushable 来", "theme_id": _THEME_ID},
-            {"netease_song_id": "602", "name": "从表格行来", "theme_id": _THEME_ID},
+            {"song_id": "601", "name": "从 pushable 来", "theme_id": _SONG_THEMES["601"]},
+            {"netease_song_id": "602", "name": "从表格行来", "theme_id": _SONG_THEMES["602"]},
         ]})
         self.assertEqual(sorted(col.calls), ["601", "602"])
 
