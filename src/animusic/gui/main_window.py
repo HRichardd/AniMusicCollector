@@ -1126,16 +1126,9 @@ class MainWindow(QMainWindow):
 
         anime.add_action("从 Bangumi 拉取「在看」", self._fetch_bangumi, "primary",
                          "读取已接管浏览器里的 Bangumi 在看列表", index=0)
-        anime.add_action("仅从 AnimeThemes 拉当季", self._fetch_animethemes, "normal",
-                         "不读 Bangumi，把当季所有有 OP/ED 的番收进来", index=1)
-        anime.add_action("增量重跑（周更）", self._update_season, "normal",
-                         "只处理新番、新曲目与之前搜不到的 —— 赛季里推荐每周跑一次",
-                         index=2)
-        # 「仅从 AnimeThemes 拉当季」会把整季写进番单（那是它的用途）。
-        # 不想留那么多时用这个一键收尾 —— 只取消纳入，不删除。
-        anime.add_action("排除补充的番", self._exclude_supplemental, "normal",
-                         "把「仅从 AnimeThemes 拉当季」带进来的番一键取消纳入。\n"
-                         "只改「纳入」、不删数据：曲目/候选/匹配决策都留着，勾回来即可恢复")
+        all_anime = anime.add_action("当季全部（来源待定）", lambda: None, "normal",
+                                    "番单来源尚未确定，暂不可用", index=1)
+        all_anime.setEnabled(False)
 
         theme.add_action("拉取 / 更新 OP/ED", self._fetch_themes, "primary",
                          "只更新**番单里已纳入**的那些番的曲目；\n"
@@ -1328,7 +1321,7 @@ class MainWindow(QMainWindow):
         season = sess.season
 
         def job(progress=None, should_stop=None):
-            return sess.run_operation('fetch_season', season, progress=progress, should_stop=should_stop)
+            return sess.run_operation('fetch_anime_list', season, progress=progress, should_stop=should_stop)
 
         self._run_task(job, f"从 Bangumi 拉取 {season.key}")
 
@@ -1678,6 +1671,8 @@ class MainWindow(QMainWindow):
                      f"（只推勾选的；每行的「目标歌单」可以让它们进不同歌单）")
 
     def _next(self) -> None:
+        if self._closing or (self.worker is not None and self.worker.isRunning()):
+            return
         i = self.stack.currentIndex()
         # ← 先把本步的人工修改落库，再往下走（手工值优先于拉取值，§8.2）
         #
@@ -1688,6 +1683,7 @@ class MainWindow(QMainWindow):
         try:
             if i == 0:
                 self.session.save_anime(self.pages[0].all_rows())
+                self.log("番单保存完成（含纳入选择）")
             elif i == 1:
                 self.session.save_themes(self.pages[1].all_rows())
             elif i == 2:

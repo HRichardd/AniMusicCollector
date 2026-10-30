@@ -225,6 +225,54 @@ class TestGuiFlow(unittest.TestCase):
 
     # ---------------------------------------------------------------- 落库
 
+    def test_confirm_anime_saves_all_rows_and_only_advances(self):
+        self._seed()
+        self.win.reload()
+        page = self.win.pages[0]
+        self.assertEqual(page.next_btn.text(), "确认番单")
+        self.assertNotIn("note", [c.key for c in page.columns])
+        page.model.rows[0].update(title_cn="确认后的名字", included=False)
+        page.filter_combo.setCurrentText("仅当季")
+        before_themes = [dict(r) for r in self.store.conn.execute("SELECT * FROM theme")]
+        with patch.object(self.sess, "run_operation") as operation, patch.object(self.win, "_run_task") as task, \
+                patch.object(self.win, "log") as log:
+            page.next_btn.click()
+            self.assertEqual(self.win.stack.currentIndex(), 1)
+            self.win._goto(0)
+            page.next_btn.click()
+            operation.assert_not_called()
+            task.assert_not_called()
+            self.assertTrue(any("番单保存完成" in call.args[0] for call in log.call_args_list))
+        saved = self.store.anime_list(self.sess.season_id, only_included=False)[0]
+        self.assertEqual(saved["title_cn"], "确认后的名字")
+        self.assertEqual(saved["included"], 0)
+        self.assertEqual(before_themes, [dict(r) for r in self.store.conn.execute("SELECT * FROM theme")])
+
+    def test_confirm_anime_save_failure_stays_on_first_page(self):
+        with patch.object(self.sess, "save_anime", side_effect=ValueError("保存失败")), \
+                patch.object(QMessageBox, "warning") as warning, \
+                patch.object(self.win, "_run_task") as task, patch.object(self.win, "log") as log:
+            self.win.pages[0].next_btn.click()
+            self.assertEqual(self.win.stack.currentIndex(), 0)
+            warning.assert_called_once()
+            task.assert_not_called()
+            self.assertFalse(any("番单保存完成" in call.args[0] for call in log.call_args_list))
+
+    def test_anime_toolbar_only_offers_anime_fetch(self):
+        page = self.win.pages[0]
+        buttons = [page.actions_layout.itemAt(j).widget() for j in range(page.actions_layout.count())]
+        texts = [b.text() for b in buttons]
+        self.assertNotIn("仅从 AnimeThemes 拉当季", texts)
+        self.assertNotIn("增量重跑（周更）", texts)
+        self.assertNotIn("排除补充的番", texts)
+        pending = next(b for b in buttons if b.text() == "当季全部（来源待定）")
+        self.assertFalse(pending.isEnabled())
+        with patch.object(self.win, "_run_task") as task, patch.object(self.sess, "run_operation") as operation:
+            buttons[0].click()
+            task.assert_called_once()
+            task.call_args.args[0]()
+            self.assertEqual(operation.call_args.args[0], "fetch_anime_list")
+
     def test_next_saves_anime_edits(self):
         self._seed()
         self.win.reload()

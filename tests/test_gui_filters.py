@@ -398,6 +398,8 @@ class TestFilterNeverChangesData(FilterTestBase):
         from PySide6.QtGui import QKeyEvent
 
         page = self.anime_page()          # 当季(可见) / 跨季(可见) / 排除(藏)
+        # 第一页仅允许移除未保存的手动新增行，来源番剧统一通过勾选排除。
+        page.model.rows[0]["origin"] = "manual"
         page._apply_filter("已排除")       # 只有「排除番」该露出来
         self._pump()
         self.assertEqual([r["title_cn"] for r in page.visible_rows()], ["排除番"])

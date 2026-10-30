@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import style
+from .anime_table import AnimeTableModel, AnimeTableView
 from .session import STATUS_LABEL
 from .widgets import CandidateItem, Column, DictTableModel, DictTableView
 from ..models import SeasonBucket
@@ -275,8 +276,8 @@ class BasePage(QWidget):
         self.model.set_rows(rows)
         self._apply_filter(self._view, log=False)
 
-    def make_table(self, model: DictTableModel) -> DictTableView:
-        tv = DictTableView(self.columns)
+    def make_table(self, model: DictTableModel, view_type=DictTableView) -> DictTableView:
+        tv = view_type(self.columns)
         tv.set_model(model)
         tv.log.connect(self.log.emit)
         # 表格自己也能增删行（右键菜单 / Delete 键）。行号会整体位移，
@@ -297,13 +298,16 @@ class AnimePage(BasePage):
             Column("air_date", "首播日", 96, "text", editable=True, align=Qt.AlignCenter),
             Column("bucket_label", "季度归属", 80, "readonly", align=Qt.AlignCenter),
             Column("origin_label", "来源", 88, "readonly", align=Qt.AlignCenter),
-            Column("note", "备注", 240, "text", editable=True),
         ]
         super().__init__(0, "① 番单确认", "来自 Bangumi「在看」", cols, parent)
-        self.next_btn.setText("确认番单，下一步 →")
+        self.next_btn.setText("确认番单")
+        self.next_btn.setToolTip("保存完整番单并进入第二步；曲名匹配由第二步手动启动")
 
-        self.model = DictTableModel(cols, rows)
-        self.table = self.make_table(self.model)
+        self.model = AnimeTableModel(cols, rows)
+        self.model.log.connect(self.log.emit)
+        self.table = self.make_table(self.model, AnimeTableView)
+        self.table.add_handler = self._add
+        self.model.dataChanged.connect(lambda *_: self._apply_filter(self._view, log=False))
         self.add_widget(self.table)
 
         self.add_action("全选", lambda: self._set_all(True))
@@ -323,18 +327,25 @@ class AnimePage(BasePage):
         # 作用域 = **当前看得见的行**（用户按下「全选」时想的是眼前这一屏），
         # 并把这件事打进日志 —— 不然筛选开着的时候「全选」到底动了多少行没人知道。
         rows = self.visible_rows()
+        scope = self._scope_hint()
+        changed = 0
         for r in rows:
-            r["included"] = v
-        self._emit_all_changed()
-        self.log.emit(f"全部{'纳入' if v else '排除'}：当前显示 {len(rows)} 行{self._scope_hint()}")
+            if bool(r.get("included")) != v:
+                index = next(i for i, item in enumerate(self.model.rows) if item is r)
+                self.model.setData(self.model.index(index, 0), v, Qt.CheckStateRole)
+                changed += 1
+        if changed:
+            self.log.emit(f"全部{'纳入' if v else '排除'}：当前显示 {len(rows)} 行{scope}，变更 {changed} 行（待保存）")
         self._apply_filter(self._view, log=False)
 
     def _invert(self) -> None:
         rows = self.visible_rows()
+        scope = self._scope_hint()
         for r in rows:
-            r["included"] = not r.get("included")
-        self._emit_all_changed()
-        self.log.emit(f"已反选：当前显示 {len(rows)} 行{self._scope_hint()}")
+            index = next(i for i, item in enumerate(self.model.rows) if item is r)
+            self.model.setData(self.model.index(index, 0), not r.get("included"), Qt.CheckStateRole)
+        if rows:
+            self.log.emit(f"已反选：当前显示 {len(rows)} 行{scope}（待保存）")
         self._apply_filter(self._view, log=False)
 
     def _add(self) -> None:

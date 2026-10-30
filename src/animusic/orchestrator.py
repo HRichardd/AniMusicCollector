@@ -1,6 +1,7 @@
 """流程编排 —— 把各层串成两条主流程。
 
-    fetch_season   读 Bangumi「在看」→ 按季度筛选 → 匹配 AnimeThemes → 落库番剧与曲目
+    fetch_anime_list  向导第一步：读 Bangumi「在看」→ 按季度筛选 → 只保存番单
+    fetch_season   旧 CLI 综合抓取：读 Bangumi → 匹配来源 → 落库番剧与曲目
     match_season   对每条 theme 构造搜索词 → 搜网易云 → 打分 → 落库候选与决策
     export         产出报告（CSV / 导入清单 / 缺失清单）
 
@@ -625,6 +626,40 @@ class Orchestrator:
         return [], "none"
 
     # ================================================================ 番单
+
+    def fetch_anime_list(self, season: Season) -> FetchReport:
+        """向导第一步只确定番单，曲目查询必须由第二步显式启动。"""
+        self._check_cancelled()
+        self.progress("读取 Bangumi「在看」列表（仅番单）…")
+        result = self.bangumi.read_watching()
+        self._check_cancelled()
+        picked = BangumiSource.filter_by_season(
+            result.subjects, season, self.config.bangumi.include_cross_season
+        )
+        sid = self.store.get_season_id(season.year, season.quarter)
+        before = [dict(r) for r in self.store.anime_list(sid, only_included=False)]
+        # 取消或保存出错时整体回滚，不能把半份新番单当作拉取完成。
+        with self.store.transaction():
+            for subject, bucket in picked:
+                self._check_cancelled()
+                self.store.upsert_anime(sid, Anime(
+                    season_key=season.key, title_cn=subject.title_cn,
+                    title_jp=subject.title_jp, bgm_id=subject.bgm_id,
+                    air_date=subject.air_date, season_bucket=bucket,
+                    origin=Origin.BANGUMI, included=True,
+                ))
+            self._check_cancelled()
+            after = [dict(r) for r in self.store.anime_list(sid, only_included=False)]
+            if before != after:
+                self.store.mark_downstream_dirty(sid, Stage.ANIME)
+            self.store.set_stage(sid, Stage.ANIME, StageStatus.FETCHED, fetched=True)
+        added = len({r["id"] for r in after} - {r["id"] for r in before})
+        self.progress(
+            f"番单拉取完成：读取 {len(result.subjects)} 部，季度筛选保留 {len(picked)} 部，"
+            f"新增 {added} 部。请确认番单；曲名匹配在第二步手动启动。"
+        )
+        return FetchReport(season=season, subjects_total=len(result.subjects),
+                           subjects_in_season=len(picked), read_path=result.path)
 
     def fetch_season(self, season: Season, retry_missing: bool = False) -> FetchReport:
         t0 = time.monotonic()

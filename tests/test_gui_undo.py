@@ -782,13 +782,14 @@ class TestUndoShortcutWiring(GuiTestBase):
         p0 = self.win.pages[0]
         logs: list[str] = []
         p0.log.connect(logs.append)
-        col = next(i for i, c in enumerate(p0.model.columns) if c.key == "note")
-        p0.model.setData(p0.model.index(0, col), "探针备注", Qt.EditRole)
-        self.assertEqual(p0.model.rows[0]["note"], "探针备注")
+        original_title = p0.model.rows[0]["title_cn"]
+        col = next(i for i, c in enumerate(p0.model.columns) if c.key == "title_cn")
+        p0.model.setData(p0.model.index(0, col), "探针番名", Qt.EditRole)
+        self.assertEqual(p0.model.rows[0]["title_cn"], "探针番名")
 
         QTest.keyClick(self.win, Qt.Key_Z, Qt.ControlModifier)
         self._pump(6)
-        self.assertEqual(p0.model.rows[0]["note"], "", "第①步的单元格撤销应生效")
+        self.assertEqual(p0.model.rows[0]["title_cn"], original_title, "第①步的单元格撤销应生效")
         self.assertTrue(any("撤销" in m for m in logs))
 
 
