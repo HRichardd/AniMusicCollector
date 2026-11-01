@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QSplitter,
     QTableView,
+    QTextBrowser,
     QVBoxLayout,
     QWidget,
 )
@@ -204,7 +205,7 @@ class BasePage(QWidget):
         shown = 0
         table = getattr(self, "table", None)
         for i, row in enumerate(self.model.rows):
-            hit = True if pred is None else bool(pred(row))
+            hit = (True if pred is None else bool(pred(row))) and self._in_scope(row)
             if table is not None and table.model() is not None:
                 table.setRowHidden(i, not hit)
             shown += int(hit)
@@ -220,6 +221,9 @@ class BasePage(QWidget):
                 self.log.emit(
                     f"  注意：这里 0 行只是**筛选**的结果，数据一条都没少（共 {total} 行）。"
                     "把筛选切回「全部」即可看到。")
+
+    def _in_scope(self, row: dict) -> bool:
+        return True
 
     def _after_filter(self) -> None:
         """筛选后要做的收尾（子类覆盖：例如重建候选面板、选中第一行）。"""
@@ -389,6 +393,7 @@ class ThemePage(BasePage):
         self.missing = missing
         self.anime_choices: list[tuple[int, str]] = []
         self.fetch_states: list[dict] = []
+        self.selected_anime_id = None
         # 三个匹配入口需要额外宽度，将曲目筛选和状态统计单独放一行。
         toolbar = self.toolbar_frame.layout()
         filter_label = toolbar.itemAt(2).widget()
@@ -398,26 +403,68 @@ class ThemePage(BasePage):
             toolbar.removeWidget(widget)
             filters.addWidget(widget)
         filters.addStretch()
-        self.body.addLayout(filters)
-        status_cols = [Column('anime', '番剧', 220, 'readonly'),
-                       Column('status_label', '抓取状态', 90, 'readonly'),
-                       Column('message', '原因 / 说明', 260, 'readonly'),
-                       Column('article_url', '维基词条', 280, 'readonly'),
-                       Column('attempts', '尝试次数', 80, 'readonly'),
-                       Column('attempted_label', '最近尝试', 155, 'readonly'),
-                       Column('wait_label', '可重试时间', 155, 'readonly')]
+        self.splitter = QSplitter(Qt.Horizontal)
+        left, right = QWidget(), QWidget()
+        left_layout, right_layout = QVBoxLayout(left), QVBoxLayout(right)
+        for layout in (left_layout, right_layout):
+            layout.setContentsMargins(0, 0, 0, 0)
+        self.anime_search = QLineEdit()
+        self.anime_search.setPlaceholderText('搜索番剧名称')
+        self.anime_status = QComboBox()
+        for label, code in [('全部状态', ''), ('待抓取', 'pending'), ('抓取中', 'running'),
+                            ('成功', 'success'), ('失败', 'failed')]:
+            self.anime_status.addItem(label, code)
+        left_layout.addWidget(self.anime_search)
+        left_layout.addWidget(self.anime_status)
+        status_cols = [Column('anime', '番剧', 180, 'readonly'),
+                       Column('status_label', '抓取状态', 100, 'readonly'),
+                       Column('theme_count', '曲目数（含排除）', 115, 'readonly')]
         self.fetch_model = DictTableModel(status_cols, [])
         self.fetch_table = QTableView()
         self.fetch_table.setModel(self.fetch_model)
-        self.fetch_table.setMaximumHeight(190)
+        self.fetch_table.setSelectionBehavior(QTableView.SelectRows)
+        self.fetch_table.setSelectionMode(QTableView.SingleSelection)
+        self.fetch_table.setWordWrap(False)
+        self.fetch_table.setTextElideMode(Qt.ElideRight)
         for i, col in enumerate(status_cols):
             self.fetch_table.setColumnWidth(i, col.width)
-        self.add_widget(self.fetch_table)
+        self.fetch_table.horizontalHeader().setStretchLastSection(True)
+        left_layout.addWidget(self.fetch_table, 1)
+        self.details_toggle = _btn('番剧查询详情 ▾')
+        self.details_toggle.setCheckable(True)
+        left_layout.addWidget(self.details_toggle)
+        self.fetch_details = QTextBrowser()
+        self.fetch_details.setOpenExternalLinks(True)
+        self.fetch_details.setMaximumHeight(210)
+        self.fetch_details.hide()
+        self.details_toggle.toggled.connect(self.fetch_details.setVisible)
+        left_layout.addWidget(self.fetch_details)
+        self.scope_label = QLabel('全部番剧曲目')
+        self.scope_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        scope = QHBoxLayout()
+        scope.addWidget(self.scope_label, 1)
+        self.show_all_btn = _btn('全部番剧曲目')
+        self.show_all_btn.clicked.connect(self._clear_anime_selection)
+        scope.addWidget(self.show_all_btn)
+        right_layout.addLayout(scope)
+        right_layout.addLayout(filters)
 
         self.model = DictTableModel(cols, rows)
         self.table = self.make_table(self.model)
         self.table.add_handler = self._add
-        self.add_widget(self.table)
+        right_layout.addWidget(self.table, 1)
+        self.splitter.addWidget(left)
+        self.splitter.addWidget(right)
+        self.splitter.setCollapsible(0, False)
+        self.splitter.setCollapsible(1, False)
+        self.splitter.setStretchFactor(0, 3)
+        self.splitter.setStretchFactor(1, 7)
+        self.splitter.setSizes([360, 840])
+        self.add_widget(self.splitter)
+        self.anime_search.textChanged.connect(self._filter_animes)
+        self.anime_status.currentIndexChanged.connect(self._filter_animes)
+        self.fetch_table.selectionModel().currentRowChanged.connect(self._select_anime)
+        self.model.dataChanged.connect(lambda *_: self._apply_filter(self._view, log=False))
 
         self.add_action("全选", lambda: self._set_all(True))
         self.add_action("+ 新增曲目", self._add, "primary", "数据源未收录时手动补充")
@@ -448,9 +495,10 @@ class ThemePage(BasePage):
             self.log.emit("请先到第①步纳入番剧，再新增曲目")
             return
         choices = [f"{name}（选项{i + 1}）" for i, (_aid, name) in enumerate(self.anime_choices)]
-        index = 0
+        index = next((i for i, (aid, _) in enumerate(self.anime_choices)
+                      if aid == self.selected_anime_id), 0)
         if len(choices) > 1:
-            picked, ok = QInputDialog.getItem(self, "新增曲目", "所属番剧", choices, 0, False)
+            picked, ok = QInputDialog.getItem(self, "新增曲目", "所属番剧", choices, index, False)
             if not ok:
                 return
             index = choices.index(picked)
@@ -475,9 +523,9 @@ class ThemePage(BasePage):
         它是这里的一个动作 —— 原来筛选框里那个「数据源未收录」是假的。
         """
         if self.missing:
-            self.log.emit("尚无曲目的番（查询状态和原因见上方列表）：" + "、".join(self.missing))
+            self.log.emit("尚无曲目的番（查询状态和原因见左侧列表）：" + "、".join(self.missing))
         else:
-            self.log.emit("所有纳入番剧均已有曲目；维基查询结果以上方状态为准")
+            self.log.emit("所有纳入番剧均已有曲目；维基查询结果以左侧状态为准")
 
     def set_fetch_states(self, states: list[dict]) -> None:
         from datetime import datetime
@@ -486,13 +534,73 @@ class ThemePage(BasePage):
         rows = []
         for state in self.fetch_states:
             row = dict(state, status_label=labels[state['status']])
+            if state['reason_code'] == 'rate_limited':
+                row['status_label'] += ' · 限流'
             row['attempted_label'] = (datetime.fromtimestamp(state['attempted_at']).strftime('%Y-%m-%d %H:%M:%S')
                                       if state['attempted_at'] is not None else '')
             row['wait_label'] = (datetime.fromtimestamp(state['retry_not_before']).strftime('%Y-%m-%d %H:%M:%S')
                                  if state['retry_not_before'] else '')
             rows.append(row)
+        selected = self.selected_anime_id
+        self.fetch_table.selectionModel().blockSignals(True)
         self.fetch_model.set_rows(rows)
+        self.fetch_table.selectionModel().blockSignals(False)
+        self.selected_anime_id = selected
+        self._filter_animes()
+        for i, row in enumerate(rows):
+            if row['anime_id'] == self.selected_anime_id:
+                self.fetch_table.setCurrentIndex(self.fetch_model.index(i, 0))
+                self._show_fetch_details(row)
+                break
         self._refresh()
+
+    def _in_scope(self, row: dict) -> bool:
+        return self.selected_anime_id is None or row.get('anime_id') == self.selected_anime_id
+
+    def _clear_anime_selection(self) -> None:
+        self.selected_anime_id = None
+        self.fetch_table.clearSelection()
+        self.fetch_table.setCurrentIndex(self.fetch_model.index(-1, -1))
+        self.scope_label.setText('全部番剧曲目')
+        self.fetch_details.clear()
+        self._apply_filter(self._view, log=False)
+
+    def _select_anime(self, current, previous) -> None:
+        if not current.isValid():
+            return
+        row = self.fetch_model.rows[current.row()]
+        self.selected_anime_id = row['anime_id']
+        self.scope_label.setText(row['anime'])
+        self.scope_label.setToolTip(row['anime'])
+        self._show_fetch_details(row)
+        self._apply_filter(self._view, log=False)
+
+    def _filter_animes(self, *_args) -> None:
+        query = self.anime_search.text().strip().casefold()
+        status = self.anime_status.currentData()
+        visible_ids = set()
+        for i, row in enumerate(self.fetch_model.rows):
+            hit = query in row['anime'].casefold() and (not status or row['status'] == status)
+            self.fetch_table.setRowHidden(i, not hit)
+            if hit:
+                visible_ids.add(row['anime_id'])
+        if self.selected_anime_id not in visible_ids:
+            self._clear_anime_selection()
+
+    def _show_fetch_details(self, row: dict) -> None:
+        from html import escape
+        diag = row.get('diagnostics') or {}
+        lines = [('番剧', row['anime']), ('状态', row['status_label']),
+                 ('原因码', row.get('reason_code', '')), ('说明', row.get('message', '')),
+                 ('来源语言', '日文维基百科'), ('查询阶段', diag.get('query_stage', '')),
+                 ('尝试次数', row.get('attempts', 0)), ('最近尝试', row.get('attempted_label', '')),
+                 ('等待至', row.get('wait_label', '')), ('曲目数（含排除）', row.get('theme_count', 0))]
+        lines.extend((key, diag[key]) for key in ('error_code', 'exception_type', 'http_status', 'api_code') if diag.get(key))
+        text = '<br>'.join(f'<b>{escape(str(k))}</b>：{escape(str(v))}' for k, v in lines)
+        url = row.get('article_url', '')
+        if url:
+            text += f'<br><a href="{escape(url, quote=True)}">{escape(url)}</a>'
+        self.fetch_details.setHtml(text)
 
     def _refresh(self) -> None:
         # 统计条一律是**全量**口径（筛选只影响看到哪几行，不影响这些事实）。

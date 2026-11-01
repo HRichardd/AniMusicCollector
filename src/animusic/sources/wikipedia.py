@@ -498,6 +498,14 @@ class ThemeFetchResult:
     message: str = ''
     retry_not_before: float = 0
     stopped: bool = False
+    diagnostics: dict = field(default_factory=lambda: {'source_language': 'ja'})
+
+
+class WikiResponseError(ValueError):
+    def __init__(self, message: str, error_code: str, api_code: str = ''):
+        super().__init__(message)
+        self.error_code = error_code
+        self.api_code = api_code
 
 
 class WikipediaSource:
@@ -579,12 +587,14 @@ class WikipediaSource:
     def fetch_result(self, names: list[str]) -> ThemeFetchResult:
         self._detailed = True
         self._inspected_pages = {}
+        self._query_stage = '查找词条'
         try:
             themes, page = self.fetch_themes(names)
             canonical = self._page_titles.get(page, page)
             url = f'https://{WIKI_HOST}/wiki/{quote(canonical.replace(" ", "_"))}' if canonical else ''
             if themes:
-                return ThemeFetchResult(themes=themes, article_url=url)
+                return ThemeFetchResult(themes=themes, article_url=url,
+                                        diagnostics={'source_language': 'ja', 'query_stage': '解析主题歌'})
             if self._inspected_pages:
                 page, text = next(iter(self._inspected_pages.items()))
                 has_section = any(theme_sections(t) for t in self._inspected_pages.values())
@@ -592,17 +602,22 @@ class WikipediaSource:
                 return ThemeFetchResult(
                     article_url=f'https://{WIKI_HOST}/wiki/{quote(canonical.replace(" ", "_"))}',
                     reason_code='no_usable_themes' if has_section else 'no_theme_section',
-                    message='未解析出可用 OP/ED' if has_section else '词条无主題歌栏目')
-            return ThemeFetchResult(reason_code='article_not_found', message='未找到匹配词条')
+                    message='未解析出可用 OP/ED' if has_section else '词条无主題歌栏目',
+                    diagnostics={'source_language': 'ja', 'query_stage': '解析主题歌'})
+            return ThemeFetchResult(reason_code='article_not_found', message='未找到匹配词条',
+                                    diagnostics={'source_language': 'ja', 'query_stage': '查找词条'})
         except RateLimited as exc:
             deadline = time.time() + exc.retry_after if exc.retry_after is not None else 0
             return ThemeFetchResult(reason_code='rate_limited', message='维基请求被限流（HTTP 429）',
-                                   retry_not_before=deadline, stopped=exc.breaker)
+                                   retry_not_before=deadline, stopped=exc.breaker,
+                                   diagnostics=self._error_diagnostics(exc))
         except (TimeoutError, urllib.error.URLError, OSError) as exc:
             reason = getattr(exc, 'reason', exc)
             timeout = isinstance(reason, TimeoutError) or 'timed out' in str(reason).lower()
             return ThemeFetchResult(reason_code='timeout' if timeout else 'network_error',
-                                   message='维基请求超时' if timeout else '维基网络请求失败')
+                                   message=('维基请求超时' if timeout else '维基网络请求失败')
+                                   + (f'：{reason}' if str(reason) else ''),
+                                   diagnostics=self._error_diagnostics(exc))
         except Exception as exc:
             # 取消必须传播到任务层，不能被包装成一次维基失败。
             if getattr(self.http, 'check_cancelled', None) is not None:
@@ -611,9 +626,24 @@ class WikipediaSource:
             timeout = isinstance(cause, TimeoutError) or isinstance(getattr(cause, 'reason', None), TimeoutError)
             timeout = timeout or 'timed out' in str(exc).lower()
             code = 'timeout' if timeout else ('network_error' if isinstance(exc, HttpError) else 'parse_error')
-            return ThemeFetchResult(reason_code=code, message=f'维基查询失败：{type(exc).__name__}')
+            message = str(exc).strip() or ('维基请求超时' if timeout else '维基查询发生异常')
+            return ThemeFetchResult(reason_code=code, message=f'{self._query_stage}：{message}',
+                                   article_url=self._diagnostic_article(),
+                                   diagnostics=self._error_diagnostics(exc))
         finally:
             self._detailed = False
+
+    def _diagnostic_article(self) -> str:
+        page = next(iter(self._inspected_pages), '')
+        canonical = self._page_titles.get(page, page)
+        return f'https://{WIKI_HOST}/wiki/{quote(canonical.replace(" ", "_"))}' if canonical else ''
+
+    def _error_diagnostics(self, exc: Exception) -> dict:
+        return {'source_language': 'ja', 'query_stage': self._query_stage,
+                'error_code': getattr(exc, 'error_code', type(exc).__name__),
+                'exception_type': type(exc).__name__,
+                'http_status': getattr(exc, 'status', 429 if isinstance(exc, RateLimited) else None),
+                'api_code': getattr(exc, 'api_code', '')}
 
     # ---- 底层
     def _api(self, params: dict) -> dict | None:
@@ -630,13 +660,22 @@ class WikipediaSource:
         """
         with self._lock:
             self.stats["api_calls"] += 1
+        self._query_stage = ('搜索词条' if params.get('list') == 'search' else
+                             '读取词条正文' if params.get('prop') == 'revisions' or params.get('action') == 'parse'
+                             else '查询维基 API')
         url = WIKI_API + "?" + "&".join(
             f"{k}={_quote(v)}" for k, v in params.items()
         )
         try:
             data = self.http.get_json(url, use_cache=not self._detailed)
-            if self._detailed and (not isinstance(data, dict) or data.get('error')):
-                raise ValueError('维基 API 响应异常')
+            if self._detailed:
+                if not isinstance(data, dict):
+                    raise WikiResponseError('维基 API 响应不是对象', 'invalid_response')
+                if data.get('error'):
+                    error = data['error']
+                    code = str(error.get('code', '')) if isinstance(error, dict) else ''
+                    info = str(error.get('info', error)) if isinstance(error, dict) else str(error)
+                    raise WikiResponseError(f'维基 API 返回错误（{code or "未知代码"}）：{info}', 'api_error', code)
             return data
         except RateLimited as e:
             with self._lock:
@@ -730,7 +769,7 @@ class WikipediaSource:
                                or any(not isinstance(p, dict) for p in q['pages'])):
             with self._lock:
                 self.stats['titles_unanswered'] += len(chunk)
-            raise ValueError('维基响应缺少有效词条列表')
+            raise WikiResponseError('维基响应缺少有效词条列表', 'invalid_pages')
         pages = {p.get("title"): p for p in (q.get("pages") or []) if p.get("title")}
         # 请求名 →（归一化）→（重定向）→ 真正的词条名。
         # 归一化那一步不能省：`A_(アニメ)` 和 `A (アニメ)` 在服务端是同一个
@@ -755,7 +794,7 @@ class WikipediaSource:
                 if self._detailed:
                     with self._lock:
                         self.stats['titles_unanswered'] += len(chunk) - index - 1
-                    raise ValueError('维基响应缺少候选词条')
+                    raise WikiResponseError('维基响应缺少候选词条', 'missing_page')
                 continue
             if p.get("missing"):
                 with self._lock:
@@ -775,7 +814,9 @@ class WikipediaSource:
                 if self._detailed:
                     with self._lock:
                         self.stats['titles_unanswered'] += len(chunk) - index - 1
-                    raise ValueError('维基响应缺少正文')
+                    self._inspected_pages[t] = ''
+                    self._page_titles[t] = final
+                    raise WikiResponseError('维基响应缺少正文', 'missing_content')
                 continue
             self._page_titles[t] = final
             self._wt_cache[t] = content
@@ -804,8 +845,12 @@ class WikipediaSource:
                        "srlimit": limit, "format": "json", "formatversion": 2})
         if d is None:
             return []
-        if self._detailed and not isinstance((d.get('query') or {}).get('search'), list):
-            raise ValueError('维基搜索响应缺少结果列表')
+        if self._detailed:
+            query_data = d.get('query')
+            if not isinstance(query_data, dict) or not isinstance(query_data.get('search'), list):
+                raise WikiResponseError('维基搜索响应缺少结果列表', 'invalid_search')
+            if any(not isinstance(h, dict) or not isinstance(h.get('title'), str) for h in query_data['search']):
+                raise WikiResponseError('维基搜索结果字段异常', 'invalid_search_item')
         return [h["title"] for h in (d.get("query") or {}).get("search", [])]
 
     # ---- 找词条
@@ -869,6 +914,7 @@ class WikipediaSource:
         wt = self.wikitext(page)
         if not wt:
             return [], ""
+        self._query_stage = '解析主题歌'
         themes = parse_from_wikitext(wt, page=page,
                                      include_interludes=include_interludes)
         if not themes:

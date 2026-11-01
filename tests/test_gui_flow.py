@@ -192,6 +192,66 @@ class TestGuiFlow(unittest.TestCase):
         task.assert_not_called()
         self.win.worker = None
 
+    def test_stop_available_with_status_message_and_page_busy(self):
+        from unittest.mock import Mock
+        self.win.stack.setCurrentIndex(1)
+        page = self.win.pages[1]
+        self.win._busy(True, '匹配全部番剧曲名')
+        self.assertTrue(self.win.status.currentMessage())
+        self.assertTrue(page.btn_stop.isEnabled())
+        self.assertTrue(page.btn_stop.isVisibleTo(self.win))
+        self.assertTrue(self.win.btn_stop.isVisibleTo(self.win))
+        self.assertFalse(page.splitter.isEnabled())
+        self.assertFalse(page.next_btn.isEnabled())
+        worker = Mock(_theme_fetch=True)
+        worker.isRunning.return_value = True
+        self.win.worker = worker
+        page.btn_stop.click()
+        worker.request_stop.assert_called_once()
+        self.assertIn('已完成结果将保留', self.win.status.currentMessage())
+        self.assertFalse(page.btn_stop.isEnabled())
+        self.win.worker = None
+        self.win._busy(False)
+        self.assertTrue(page.splitter.isEnabled())
+        self.assertFalse(page.btn_stop.isEnabled())
+
+    def test_independent_anime_filters_keep_hidden_edits_undo_and_save(self):
+        from PySide6.QtCore import Qt
+        aid, tid, _ = self._seed()
+        other = self.store.upsert_anime(self.sess.season_id, Anime(
+            season_key='2026Q4', title_jp='另一部长番名'))
+        self.store.upsert_theme(other, Theme(anime_id=other, kind=ThemeKind.ED,
+            song_title='另一首', artists=['B'], source='manual', origin=Origin.MANUAL))
+        self.store.set_theme_fetch(other, 'failed', reason_code='timeout', message='测试超时')
+        self.win.reload()
+        page = self.win.pages[1]
+        self.assertEqual(page.splitter.orientation(), Qt.Horizontal)
+        self.assertEqual(len(page.visible_rows()), 2)
+        edited_index = next(i for i, r in enumerate(page.all_rows()) if r['theme_id'] == tid)
+        page.model.setData(page.model.index(edited_index, 4), '人工改名')
+        page.model.setData(page.model.index(edited_index, 0), False, Qt.CheckStateRole)
+        page.fetch_table.setCurrentIndex(page.fetch_model.index(1, 0))
+        page._apply_filter('仅 ED', log=False)
+        self.assertEqual([r['anime_id'] for r in page.visible_rows()], [other])
+        page.anime_status.setCurrentIndex(page.anime_status.findData('failed'))
+        page.anime_search.setText('长番名')
+        self.assertEqual(len(page.all_rows()), 2)
+        self.assertIn('测试超时', page.fetch_details.toPlainText())
+        self.assertIsNotNone(page.model.undo())
+        self.assertTrue(page.all_rows()[edited_index]['included'])
+        page.model.setData(page.model.index(edited_index, 0), False, Qt.CheckStateRole)
+        self.sess.save_themes(page.all_rows(), confirm=False)
+        saved = next(r for r in self.store.theme_list(self.sess.season_id, False) if r['id'] == tid)
+        self.assertEqual((saved['song_title'], saved['included']), ('人工改名', 0))
+        page.anime_search.clear()
+        page.anime_status.setCurrentIndex(0)
+        page.fetch_table.setCurrentIndex(page.fetch_model.index(0, 0))
+        self.assertEqual(page.visible_rows(), [])  # 番A只有OP，与ED筛选取交集。
+        page.show_all_btn.click()
+        self.assertEqual([r['anime_id'] for r in page.visible_rows()], [other])
+        page._apply_filter('全部', log=False)
+        self.assertEqual(len(page.visible_rows()), 2)
+
     # ---------------------------------------------------------------- 数据反映
 
     def test_reload_populates_pages(self):

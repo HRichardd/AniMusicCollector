@@ -17,6 +17,7 @@ GUI 的后台任务（`gui/workers.py` 的 `TaskWorker`）在别的线程里调�
 from __future__ import annotations
 
 import logging
+import json
 import os
 import sqlite3
 import threading
@@ -257,6 +258,11 @@ class Store:
         self.conn.executescript(SCHEMA)     # 建表（顺带在当前线程建出第一条连接）
         self._migrate_theme_identity()
         self._migrate_push_selection()
+        if 'diagnostics' not in {r['name'] for r in self.conn.execute('PRAGMA table_info(theme_fetch)')}:
+            self.conn.execute("ALTER TABLE theme_fetch ADD COLUMN diagnostics TEXT NOT NULL DEFAULT '{}'")
+        # 旧限流记录只改归类，保留原始原因、次数和服务端期限，重复打开也安全。
+        self.conn.execute("UPDATE theme_fetch SET status='pending' "
+                          "WHERE status='failed' AND reason_code='rate_limited'")
         # 只在打开 Store 时恢复，不在页面刷新时修改正在运行的任务。
         self.conn.execute("UPDATE theme_fetch SET status='pending', reason_code='interrupted', "
                           "message='上次任务异常中断，待重新查询' WHERE status='running'")
@@ -265,23 +271,27 @@ class Store:
     def theme_fetch_rows(self, season_id: int) -> list[dict]:
         rows = [dict(r) for r in self.conn.execute(
             "SELECT f.*, COALESCE(NULLIF(a.title_cn,''),NULLIF(a.title_jp,''),a.title_romaji,'?') AS anime, "
-            "a.included FROM theme_fetch f JOIN anime a ON a.id=f.anime_id "
+            "a.included, (SELECT COUNT(*) FROM theme t WHERE t.anime_id=a.id) AS theme_count "
+            "FROM theme_fetch f JOIN anime a ON a.id=f.anime_id "
             "WHERE a.season_id=? ORDER BY a.id", (season_id,))]
         deadline = self.source_wait_until()
         for row in rows:
             row['retry_not_before'] = max(row['retry_not_before'], deadline)
+            row['diagnostics'] = json.loads(row['diagnostics'])
+            if row['reason_code'] == 'query_changed':
+                row['diagnostics'] = {}
         return rows
 
     def set_theme_fetch(self, anime_id: int, status: str, *, reason_code: str = '',
                         message: str = '', article_url: str = '',
                         retry_not_before: float = 0, saved_count: int = 0,
-                        start: bool = False) -> None:
+                        start: bool = False, diagnostics: dict | None = None) -> None:
         import time
         self.conn.execute(
-            "UPDATE theme_fetch SET status=?,reason_code=?,message=?,article_url=?,"
+            "UPDATE theme_fetch SET status=?,reason_code=?,message=?,article_url=?,diagnostics=?,"
             "retry_not_before=?,saved_count=?,attempts=attempts+?,"
             "attempted_at=CASE WHEN ? THEN ? ELSE attempted_at END WHERE anime_id=?",
-            (status, reason_code, message, article_url, retry_not_before, saved_count,
+            (status, reason_code, message, article_url, json.dumps(diagnostics or {}, ensure_ascii=False), retry_not_before, saved_count,
              int(start), int(start), time.time(), anime_id))
         self._commit()
 

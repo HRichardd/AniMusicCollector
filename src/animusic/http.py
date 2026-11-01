@@ -428,6 +428,19 @@ class HttpClient:
                        f"{brief_url(url)} —— {err}")
 
     # ---- 核心请求
+    def _wait_retry(self, seconds: float) -> None:
+        # 有取消回调时分段检查；累计等待不缩短，不能提前重试服务端请求。
+        if self.check_cancelled is None:
+            time.sleep(seconds)
+            return
+        remaining = seconds
+        while remaining > 0:
+            self.check_cancelled()
+            step = min(0.1, remaining)
+            time.sleep(step)
+            remaining -= step
+        self.check_cancelled()
+
     def request(
         self,
         method: str,
@@ -564,7 +577,7 @@ class HttpClient:
                                    f"（本 URL 最多为限流重试 "
                                    f"{self.rate_limit_retries} 次；本步剩余预算 "
                                    f"{left - nap:.1f} 秒）")
-                        time.sleep(nap)
+                        self._wait_retry(nap)
                         retry_kind = "rate_limit"
                         continue
                     if nap > left and not self._rl_budget_spent:
@@ -600,7 +613,7 @@ class HttpClient:
                 # 指数退避 + 抖动（只管网络抖动与 5xx；429 在上面单独处理）
                 nap = min(8.0, (2.0**i) * 0.5) * (0.7 + random.random() * 0.6)
                 self.stats.backoff += nap
-                time.sleep(nap)
+                self._wait_retry(nap)
                 i += 1
                 retry_kind = "network"
                 continue

@@ -643,9 +643,14 @@ class TestBatchOverRealHttp(unittest.TestCase):
                 pass
 
         self.srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
-        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
-        self.addCleanup(self.srv.shutdown)
-        self.addCleanup(self.srv.server_close)
+        server_thread = threading.Thread(target=self.srv.serve_forever, daemon=True)
+        server_thread.start()
+        def close_server():
+            # cleanup 按后进先出执行；先关 socket 会让 serve_forever 在 Windows 报10038。
+            self.srv.shutdown()
+            server_thread.join(timeout=2)
+            self.srv.server_close()
+        self.addCleanup(close_server)
 
     def _src(self):
         from unittest import mock

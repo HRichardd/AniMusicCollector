@@ -542,7 +542,7 @@ class TestOrchestratorFallback(unittest.TestCase):
         rows = store.theme_list(store.get_season_id(2026, 4))
         self.assertEqual(rows, [])
         states = store.theme_fetch_rows(store.get_season_id(2026, 4))
-        self.assertEqual((states[0]['status'], states[0]['reason_code']), ('failed', 'rate_limited'))
+        self.assertEqual((states[0]['status'], states[0]['reason_code']), ('pending', 'rate_limited'))
 
 
 # ==================================================================== 汇总行

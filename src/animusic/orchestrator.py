@@ -684,8 +684,10 @@ class Orchestrator:
                         self.store.save_source_wait(result.retry_not_before)
                     if result.reason_code:
                         self.store.set_theme_fetch(
-                            aid, 'failed', reason_code=result.reason_code, message=result.message,
-                            article_url=result.article_url, retry_not_before=result.retry_not_before)
+                            aid, 'pending' if result.reason_code == 'rate_limited' else 'failed',
+                            reason_code=result.reason_code, message=result.message,
+                            article_url=result.article_url, retry_not_before=result.retry_not_before,
+                            diagnostics=result.diagnostics)
                     else:
                         # 一部番的任意保存冲突都会回滚该番，避免半成功与成功状态不一致。
                         with self.store.transaction():
@@ -700,7 +702,7 @@ class Orchestrator:
                                     included=True, note=theme.note or '')))
                             self._check_cancelled()
                             self.store.set_theme_fetch(aid, 'success', article_url=result.article_url,
-                                                       saved_count=len(theme_ids))
+                                                       saved_count=len(theme_ids), diagnostics=result.diagnostics)
                             current = [dict(t) for t in self.store.theme_list(sid, only_included=False)]
                             if current != previous:
                                 self.store.mark_downstream_dirty(sid, Stage.THEME)
@@ -708,7 +710,8 @@ class Orchestrator:
                         rep.themes_written += len(result.themes)
                     finished.add(aid)
                     if result.reason_code:
-                        self.progress(f'  失败：{result.message} [{result.reason_code}]')
+                        label = '待抓取' if result.reason_code == 'rate_limited' else '失败'
+                        self.progress(f'  {label}：{result.message} [{result.reason_code}]')
                     if result.stopped or self.store.source_wait_until() > time.time():
                         pending_message = '本轮因限流未查询，待服务端等待期限满足后继续'
                         self.progress('限流或服务端等待要求使本轮停止；未轮到的番剧保留待抓取')
@@ -722,6 +725,9 @@ class Orchestrator:
                                                article_url=result.article_url if result else '')
                     finished.add(aid)
                     self.progress(f'  保存失败：{type(exc).__name__}: {exc}')
+        except OperationCancelled:
+            pending_message = '用户已取消，本轮未完成，待重新查询'
+            raise
         finally:
             # 仅修改本轮目标；不增加未轮到项目的尝试次数，也不改已完成结果。
             with self.store.transaction():

@@ -1085,7 +1085,7 @@ class MainWindow(QMainWindow):
         self.btn_stop = QPushButton("停止任务")
         self.btn_stop.setEnabled(False)
         self.btn_stop.clicked.connect(self._stop_task)
-        self.status.addWidget(self.btn_stop)
+        self.status.addPermanentWidget(self.btn_stop)
         # 留住引用：见下面 QTimer 那段注释 —— 这个项目已经因为「匿名 QObject 交给 GC」
         # 吃过一次间歇性崩溃（0xC0000409）。QShortcut 没有定时器、风险低得多，
         # 但留着引用是免费的，而且下次读代码的人不会再来一遍这个推理。
@@ -1136,6 +1136,8 @@ class MainWindow(QMainWindow):
                          "只查询待抓取番剧，继续补齐取消或限流后未处理的项目", index=1)
         theme.add_action("重新匹配失败番剧曲名", self._retry_failed_themes, "normal",
                          "只重新查询失败番剧，跳过成功和待抓取项目", index=2)
+        theme.btn_stop = theme.add_action('停止匹配', self._stop_task, index=3)
+        theme.btn_stop.setEnabled(False)
 
         match.add_action("开始匹配网易云", self._run_match, "primary",
                          "对每条曲目搜索并打分（后台执行）", index=0)
@@ -1247,6 +1249,17 @@ class MainWindow(QMainWindow):
         self.env.setEnabled(not on and not self._closing)
         self.stepper.setEnabled(not on and not self._closing)
         self.btn_stop.setEnabled(on and not self._closing)
+        theme = self.pages[1]
+        theme_task = label in ('匹配全部番剧曲名', '匹配待抓取番剧', '重新匹配失败番剧曲名')
+        # 禁用编辑与提交控件，保留页面祖先可用，否则子按钮单独启用也无效。
+        theme.setEnabled(not self._closing and (not on or theme_task))
+        theme.splitter.setEnabled(not on and not self._closing)
+        theme.back_btn.setEnabled(not on and not self._closing)
+        theme.next_btn.setEnabled(not on and not self._closing)
+        for i in range(theme.actions_layout.count()):
+            button = theme.actions_layout.itemAt(i).widget()
+            button.setEnabled(not on and not self._closing)
+        theme.btn_stop.setEnabled(on and theme_task and not self._closing)
         if on:
             self.status.showMessage(f"  ⏳ {label}…")
             self.log(f"▶ {label}（后台执行，界面不会卡）")
@@ -1310,7 +1323,11 @@ class MainWindow(QMainWindow):
         if self.worker is not None and self.worker.isRunning():
             self.worker.request_stop()
             self.btn_stop.setEnabled(False)
-            self.log("已请求停止，正在等待当前操作完成回查与记账")
+            self.pages[1].btn_stop.setEnabled(False)
+            message = ('正在停止，已完成结果将保留' if getattr(self.worker, '_theme_fetch', False)
+                       else '已请求停止，正在等待当前操作完成回查与记账')
+            self.status.showMessage(message)
+            self.log(message)
 
     @Slot()
     def _task_finished(self, worker=None) -> None:

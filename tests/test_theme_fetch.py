@@ -65,21 +65,57 @@ class TestThemeFetch(unittest.TestCase):
         self.orch.retry_failed_themes(self.season)
         self.orch.wikipedia.fetch_result.assert_called_once_with(['番B'])
 
-    def test_breaker_current_failed_remaining_pending_and_can_resume(self):
+    def test_breaker_current_pending_remaining_pending_and_can_resume(self):
         self.orch.wikipedia.fetch_result.side_effect = [
             ThemeFetchResult(themes=[song()]),
             ThemeFetchResult(reason_code='rate_limited', message='限流', stopped=True)]
         self.orch.refresh_themes(self.season)
         states = self.states()
-        self.assertEqual([r['status'] for r in states.values()], ['success', 'failed', 'pending'])
+        self.assertEqual([r['status'] for r in states.values()], ['success', 'pending', 'pending'])
         self.assertEqual([r['attempts'] for r in states.values()], [1, 1, 0])
         self.orch.wikipedia.fetch_result.side_effect = None
         self.orch.wikipedia.fetch_result.reset_mock()
         self.orch.fetch_pending_themes(self.season)
-        self.orch.wikipedia.fetch_result.assert_called_once_with(['番C'])
+        self.assertEqual(self.orch.wikipedia.fetch_result.call_args_list,
+                         [unittest.mock.call(['番B']), unittest.mock.call(['番C'])])
         self.orch.wikipedia.fetch_result.reset_mock()
         self.orch.retry_failed_themes(self.season)
-        self.orch.wikipedia.fetch_result.assert_called_once_with(['番B'])
+        self.orch.wikipedia.fetch_result.assert_not_called()
+
+    def test_old_rate_limit_migration_preserves_data_and_wait(self):
+        self.orch.refresh_themes(self.season)
+        tid = self.store.theme_list(self.sid)[0]['id']
+        self.store.upsert_candidate(tid, Candidate(theme_id=tid, netease_song_id='123',
+            name='历史候选', artists=['艺人'], duration_ms=1000, score=0.8, score_detail={}, origin=Origin.SEARCH))
+        self.store.set_decision(tid, DecisionStatus.SKIPPED, decided_by='human')
+        self.store.mark_pushed('历史歌单', '123', tid)
+        deadline = time.time() + 3600
+        self.store.set_theme_fetch(self.ids[1], 'failed', reason_code='rate_limited',
+                                   message='原始限流原因', retry_not_before=deadline, start=True,
+                                   diagnostics={'query_stage': '读取正文', 'source_language': 'ja'})
+        self.store.set_theme_fetch(self.ids[2], 'failed', reason_code='timeout', message='原始超时')
+        self.store.save_source_wait(deadline)
+        original = self.states()[self.ids[1]]
+        before = {name: [tuple(r) for r in self.store.conn.execute(f'SELECT * FROM {name}')]
+                  for name in ('anime', 'theme', 'candidate', 'decision', 'pushed')}
+        for _ in range(2):
+            self.store.close()
+            self.store = Store(self.path)
+            self.orch.store = self.store
+            self.assertEqual(self.states()[self.ids[1]], dict(original, status='pending'))
+            self.assertEqual(self.states()[self.ids[2]]['status'], 'failed')
+            self.assertEqual(before, {name: [tuple(r) for r in self.store.conn.execute(f'SELECT * FROM {name}')]
+                                      for name in before})
+        self.orch.wikipedia.fetch_result.reset_mock()
+        self.orch.fetch_pending_themes(self.season)
+        self.orch.wikipedia.fetch_result.assert_not_called()
+
+    def test_actual_count_includes_excluded_and_is_not_saved_count(self):
+        self.orch.refresh_themes(self.season)
+        self.store.conn.execute('UPDATE theme SET included=0 WHERE anime_id=?', (self.ids[0],))
+        self.store.set_theme_fetch(self.ids[0], 'pending')
+        row = self.states()[self.ids[0]]
+        self.assertEqual((row['theme_count'], row['saved_count']), (1, 0))
 
     def test_cancel_current_and_remaining_pending_finished_kept(self):
         stop = [False]
@@ -292,6 +328,52 @@ class TestWikiFetchResult(unittest.TestCase):
         with self.assertRaises(OperationCancelled):
             src.fetch_result(['作品A'])
 
+    def test_readable_diagnostics_distinguish_responses_and_persist(self):
+        payloads = [({'error': {'code': 'badvalue', 'info': '无效参数'}}, 'api_error', '无效参数'),
+                    ({'query': {}}, 'invalid_pages', '词条列表'),
+                    ({'query': {'pages': [{'title': '作品A (アニメ)', 'revisions': []}]}},
+                     'missing_content', '缺少正文')]
+        for payload, code, message in payloads:
+            with self.subTest(code=code):
+                src, _ = self.source()
+                src.begin_round()
+                src.http.get_json = Mock(return_value=payload)
+                result = src.fetch_result(['作品A'])
+                self.assertIn(message, result.message)
+                self.assertEqual(result.diagnostics['error_code'], code)
+                self.assertEqual(result.diagnostics['query_stage'], '读取词条正文')
+                self.assertEqual(result.diagnostics['source_language'], 'ja')
+                if code == 'missing_content':
+                    self.assertTrue(result.article_url)
+                with tempfile.TemporaryDirectory() as folder:
+                    store = Store(os.path.join(folder, 'state.db'))
+                    sid = store.get_season_id(2026, 4)
+                    aid = store.upsert_anime(sid, Anime(season_key='2026Q4', title_jp='作品A'))
+                    store.set_theme_fetch(aid, 'failed', reason_code=result.reason_code,
+                                          message=result.message, diagnostics=result.diagnostics)
+                    self.assertEqual(store.theme_fetch_rows(sid)[0]['diagnostics'], result.diagnostics)
+                    store.close()
+
+    def test_cancel_during_rate_limit_wait_prevents_retry(self):
+        client = HttpClient(rps=0, retries=0, rate_limit_retries=1, rate_limit_wait_budget=30)
+        stopped = [False]
+        def check():
+            if stopped[0]:
+                raise OperationCancelled('停止')
+        client.check_cancelled = check
+        client.on_rate_limit = Mock()
+        limited = urllib.error.HTTPError('https://ja.wikipedia.org/test', 429, 'limit', {'Retry-After': '5'}, None)
+        try:
+            with patch('animusic.http.urllib.request.urlopen', side_effect=limited) as request, \
+                    patch('animusic.http.time.sleep', side_effect=lambda _: stopped.__setitem__(0, True)):
+                with self.assertRaises(OperationCancelled):
+                    client.get_json('https://ja.wikipedia.org/test')
+            request.assert_called_once()
+            client.on_rate_limit.assert_called_once()
+            self.assertGreater(client.on_rate_limit.call_args.args[0], time.time())
+        finally:
+            limited.close()
+
     def test_real_http_wrapper_preserves_empty_timeout_cause(self):
         for error, expected in [(TimeoutError(), 'timeout'),
                                 (urllib.error.URLError(TimeoutError()), 'timeout'),
@@ -306,6 +388,7 @@ class TestWikiFetchResult(unittest.TestCase):
     def test_wait_requirement_persisted_before_automatic_wait(self):
         client = HttpClient(rps=0, retries=0, rate_limit_retries=1, rate_limit_wait_budget=30)
         client.on_rate_limit = Mock()
+        client.check_cancelled = Mock()
         response = SimpleNamespace(status=200, headers={}, read=lambda: b'{}')
         response.__enter__ = lambda s: s
         response.__exit__ = lambda *args: None
@@ -318,5 +401,5 @@ class TestWikiFetchResult(unittest.TestCase):
         self.assertEqual(client.stats.requests, 2)
         self.assertEqual(client.stats.rate_limit_retries, 1)
         client.on_rate_limit.assert_called_once()
-        sleep.assert_any_call(5.0)
+        self.assertAlmostEqual(sum(call.args[0] for call in sleep.call_args_list), 5.0)
 
