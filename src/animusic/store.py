@@ -107,6 +107,15 @@ CREATE TABLE IF NOT EXISTS source_wait (
     source TEXT PRIMARY KEY,
     retry_not_before REAL NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS wiki_type_choice (
+    anime_id INTEGER NOT NULL REFERENCES anime(id) ON DELETE CASCADE,
+    language TEXT NOT NULL,
+    article_url TEXT NOT NULL,
+    song_title TEXT NOT NULL,
+    artists TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK(kind IN ('OP','ED')),
+    PRIMARY KEY(anime_id,language,article_url,song_title,artists)
+);
 INSERT OR IGNORE INTO theme_fetch(anime_id) SELECT id FROM anime;
 CREATE TRIGGER IF NOT EXISTS anime_theme_fetch_insert AFTER INSERT ON anime
 BEGIN
@@ -298,6 +307,22 @@ class Store:
     def source_wait_until(self, source: str = 'wikipedia') -> float:
         row = self.conn.execute("SELECT retry_not_before FROM source_wait WHERE source=?", (source,)).fetchone()
         return float(row[0]) if row else 0.0
+
+    def wiki_type_choice(self, anime_id: int, item: dict) -> str | None:
+        row = self.conn.execute('SELECT kind FROM wiki_type_choice WHERE anime_id=? AND language=? '
+            'AND article_url=? AND song_title=? AND artists=?',
+            (anime_id, item['source_language'], item['article_url'], item['song_title'],
+             artists_to_json(item['artists']))).fetchone()
+        return row[0] if row else None
+
+    def confirm_wiki_type(self, anime_id: int, item: dict, kind: str) -> None:
+        if kind not in ('OP', 'ED'):
+            raise ValueError('主题曲类型必须为 OP 或 ED')
+        self.conn.execute('INSERT INTO wiki_type_choice VALUES(?,?,?,?,?,?) '
+            'ON CONFLICT(anime_id,language,article_url,song_title,artists) DO UPDATE SET kind=excluded.kind',
+            (anime_id, item['source_language'], item['article_url'], item['song_title'],
+             artists_to_json(item['artists']), kind))
+        self._commit()
 
     def save_source_wait(self, deadline: float, source: str = 'wikipedia') -> None:
         self.conn.execute("INSERT INTO source_wait(source,retry_not_before) VALUES(?,?) "
@@ -637,12 +662,19 @@ class Store:
             existing = legacy[0] if legacy else None
 
         if existing is None:
+            if t.source == 'wikipedia' and t.raw:
+                language = t.raw.get('source_language', 'ja')
+                others = self.conn.execute('SELECT raw FROM theme WHERE anime_id=? AND source=? '
+                    'AND source_kind=? AND COALESCE(source_sequence,0)=COALESCE(?,0)',
+                    (anime_id, t.source, str(t.kind), t.sequence))
+                if any((json.loads(r['raw'] or '{}').get('source_language', 'ja') != language) for r in others):
+                    raise ThemeIdentityConflict('不同语言的同类型曲目无法确认是否同一首，保留旧曲目，请核对来源')
             cur = self.conn.execute(
                 """
                 INSERT INTO theme (anime_id, kind, sequence, song_title, artists,
                                    source, origin, included, note,
-                                   source_kind, source_sequence, source_song_title)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                                   source_kind, source_sequence, source_song_title,raw)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     anime_id, str(t.kind), t.sequence, t.song_title,
@@ -651,12 +683,23 @@ class Store:
                     str(t.kind) if t.origin != Origin.MANUAL else None,
                     t.sequence if t.origin != Origin.MANUAL else None,
                     t.song_title if t.origin != Origin.MANUAL else None,
+                    json.dumps(t.raw, ensure_ascii=False) if t.raw else None,
                 ),
             )
             self._commit()
             return int(cur.lastrowid)
 
         protected = existing["origin"] == str(Origin.MANUAL)
+        if t.source == 'wikipedia' and t.raw:
+            previous_raw = json.loads(existing['raw'] or '{}')
+            provenance = previous_raw.get('wikipedia_sources', [])
+            if not provenance and previous_raw.get('article_url'):
+                provenance.append({k: v for k, v in previous_raw.items() if k != 'wikipedia_sources'})
+            if t.raw not in provenance:
+                provenance.append(t.raw)
+            merged = dict(previous_raw or t.raw, wikipedia_sources=provenance)
+            self.conn.execute('UPDATE theme SET raw=? WHERE id=?',
+                              (json.dumps(merged, ensure_ascii=False), existing['id']))
         fields = {
             "artists": artists_to_json(t.artists) if t.artists else None,
             "sequence": t.sequence,
@@ -674,6 +717,7 @@ class Store:
         if sets:
             vals.append(existing["id"])
             self.conn.execute(f"UPDATE theme SET {', '.join(sets)} WHERE id=?", vals)
+        if sets or (t.source == 'wikipedia' and t.raw):
             self._commit()
         return int(existing["id"])
 

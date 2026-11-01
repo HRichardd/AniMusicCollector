@@ -675,14 +675,32 @@ class Orchestrator:
                 aid = a['id']
                 self.store.set_theme_fetch(aid, 'running', start=True)
                 self.progress(f'第 {i}/{len(animes)} 部：{a["title_cn"] or a["title_jp"] or a["title_romaji"] or "?"}…')
-                names = [x for x in (a['title_cn'], a['title_jp'], a['title_romaji']) if x]
+                names = [x for x in (a['title_jp'], a['title_cn'], a['title_romaji']) if x]
                 result = None
                 try:
-                    result = self._wiki_result(names)
+                    if isinstance(self.wikipedia, WikipediaSource):
+                        result = self.wikipedia.fetch_result(names, title_jp=a['title_jp'] or '', title_cn=a['title_cn'] or '')
+                    else:
+                        result = self._wiki_result(names)
+                    if result.reason_code == 'type_unconfirmed':
+                        from .sources.wikipedia import WikiTheme
+                        unresolved = []
+                        for item in result.diagnostics.get('untyped_themes', []):
+                            kind = self.store.wiki_type_choice(aid, item)
+                            if kind:
+                                result.themes.append(WikiTheme(kind=kind, song_title=item['song_title'],
+                                    artists=item['artists'], raw=item['raw'], source_language=item['source_language'],
+                                    section=item['section']))
+                            else:
+                                unresolved.append(item)
+                        result.diagnostics['untyped_themes'] = unresolved
+                        if not unresolved:
+                            result.reason_code = ''
+                            result.message = '主题曲类型已由用户确认'
                     self._check_cancelled()
                     if result.retry_not_before:
                         self.store.save_source_wait(result.retry_not_before)
-                    if result.reason_code:
+                    if result.reason_code and result.reason_code != 'type_unconfirmed':
                         self.store.set_theme_fetch(
                             aid, 'pending' if result.reason_code == 'rate_limited' else 'failed',
                             reason_code=result.reason_code, message=result.message,
@@ -699,10 +717,15 @@ class Orchestrator:
                                     anime_id=aid, kind=theme.kind, song_title=theme.song_title,
                                     artists=theme.artists, sequence=theme.sequence,
                                     source='wikipedia', origin=Origin.SEARCH,
-                                    included=True, note=theme.note or '')))
+                                    included=True, note=theme.note or '',
+                                    raw={'source_language': getattr(theme, 'source_language', 'ja'), 'article_url': result.article_url,
+                                         'section': getattr(theme, 'section', ''), 'source_text': getattr(theme, 'raw', ''),
+                                         'original_title': theme.song_title})))
                             self._check_cancelled()
-                            self.store.set_theme_fetch(aid, 'success', article_url=result.article_url,
-                                                       saved_count=len(theme_ids), diagnostics=result.diagnostics)
+                            result.diagnostics['accepted_theme_ids'] = sorted(theme_ids)
+                            self.store.set_theme_fetch(aid, 'failed' if result.reason_code else 'success',
+                                reason_code=result.reason_code, message=result.message,
+                                article_url=result.article_url, saved_count=len(theme_ids), diagnostics=result.diagnostics)
                             current = [dict(t) for t in self.store.theme_list(sid, only_included=False)]
                             if current != previous:
                                 self.store.mark_downstream_dirty(sid, Stage.THEME)
@@ -722,7 +745,8 @@ class Orchestrator:
                     self.store.set_theme_fetch(aid, 'failed',
                                                reason_code='save_conflict' if result is not None else 'parse_error',
                                                message=f'处理未完成：{type(exc).__name__}: {exc}',
-                                               article_url=result.article_url if result else '')
+                                               article_url=result.article_url if result else '',
+                                               diagnostics=result.diagnostics if result else {})
                     finished.add(aid)
                     self.progress(f'  保存失败：{type(exc).__name__}: {exc}')
         except OperationCancelled:
@@ -1624,6 +1648,8 @@ class Orchestrator:
                     query_used = query_used or (c["query_used"] or "")
 
             dur = ""
+            import json
+            source_info = json.loads(row['raw'] or '{}')
             ex.record(
                 anime=row["anime_cn"] or row["anime_jp"] or "",
                 kind=row["kind"],
@@ -1643,5 +1669,8 @@ class Orchestrator:
                 # 取值来自 `Theme.source`（落库时写的是 `wikipedia` /
                 # `animethemes`，见 `_collect_themes`），不是猜的。
                 source=row["source"] or "",
+                source_language=source_info.get('source_language', ''),
+                source_url=source_info.get('article_url', ''),
+                source_section=source_info.get('section', ''),
             )
         return ex.export(out_dir)

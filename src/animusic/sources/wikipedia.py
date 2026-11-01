@@ -127,6 +127,8 @@ class WikiTheme:
     raw: str = ""
     fmt: str = ""               # list | table
     page: str = ""
+    source_language: str = 'ja'
+    section: str = ''
 
     @property
     def is_interlude(self) -> bool:
@@ -147,6 +149,10 @@ _TAG = re.compile(r"<[^>]+>")
 def clean_wikitext(s: str) -> str:
     s = _COMMENT.sub("", s)
     s = _REF.sub("", s)
+    # 语言标注模板的参数本身就是显示文本；直接删除会把中文页里的日文曲名一起删掉。
+    s = re.sub(r'\{\{\s*(?:lj|lang-ja)\s*\|([^{}]+)\}\}', r'\1', s, flags=re.I)
+    s = re.sub(r'\{\{\s*lang\s*\|[a-z-]+\s*\|([^{}]+)\}\}', r'\1', s, flags=re.I)
+    s = re.sub(r'\{\{\s*(?:单双书号转换|單雙書號轉換)\s*\|([^{}|]+)\}\}', r'\1', s)
     for _ in range(6):                  # 模板可能嵌套
         s2 = _TMPL.sub("", s)
         if s2 == s:
@@ -210,9 +216,10 @@ def _seq_of(text: str) -> int | None:
 #: 纯粹是被后缀挡住了。
 _SEASON_SUFFIX = re.compile(
     r"[\s　]*("
-    r"第[0-9一二三四五六七八九十]+(期|クール|シリーズ|部作?)"
+    r"第[0-9一二三四五六七八九十]+(期|季|クール|シリーズ|部作?)"
     r"|[0-9]+(st|nd|rd|th)\s+Season"
     r"|Season\s*[0-9]+"
+    r"|[0-9]+(?:st|nd|rd|th)(?:\s*(?:&|＆|and)\s*[0-9]+(?:st|nd|rd|th))?\s+STAGE"
     r"|シーズン[0-9]+"
     r"|[ⅡⅢⅣⅤ]+"
     r")[\s　]*$",
@@ -320,8 +327,10 @@ def theme_sections(wikitext: str) -> list[str]:
     out: list[str] = []
     for m in _SECTION_RX.finditer(wikitext):
         start = m.end()
-        nxt = re.search(r"^=+[^=\n]+=+\s*$", wikitext[start:], re.M)
-        out.append(wikitext[start:start + (nxt.start() if nxt else 5000)])
+        level = len(re.match(r'=+', m.group()).group())
+        nxt = next((h for h in re.finditer(r'^(={2,6})[^=\n]+\1\s*$', wikitext[start:], re.M)
+                    if len(h[1]) <= level), None)
+        out.append(wikitext[start:start + min(nxt.start() if nxt else len(wikitext) - start, 120000)])
     return out
 
 
@@ -352,7 +361,7 @@ def parse_from_wikitext(wikitext: str, page: str = "",
 def _artist_from_desc(desc: str) -> str:
     m = re.search(r"^(.+?)による", desc)
     if m:
-        return m.group(1).strip(" 、,")
+        return re.sub(r'(?:作詞|作曲|編曲|[・、\s])+$', '', m.group(1)).strip(" 、,")
     m = re.search(r"^(.+?)[のが]", desc)
     return m.group(1).strip() if m else ""
 
@@ -467,7 +476,7 @@ def canon_title(s: str) -> str:
     if not s:
         return ""
     s = s.lower()
-    s = re.sub(r"\s*\((アニメ|テレビアニメ|漫画|小説|曖昧さ回避)\)\s*$", "", s)
+    s = re.sub(r"\s*\((アニメ|テレビアニメ|漫画|小説|曖昧さ回避|動畫|动画|電視動畫|电视动画|漫畫)\)\s*$", "", s)
     s = s.replace("\u30fb", "").replace("\u30a0", "")   # ・ ゠
     # 只留字母、数字、假名、汉字 —— 其余符号一律丢弃
     s = re.sub(r"[^0-9a-z\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff]", "", s)
@@ -523,7 +532,14 @@ class WikipediaSource:
                  on_event=None,
                  rate_limit_wait_budget: float = constants.RATE_LIMIT_WAIT_BUDGET,
                  rate_limit_retries: int = constants.RATE_LIMIT_RETRIES,
-                 rate_limit_breaker: int = constants.RATE_LIMIT_BREAKER):
+                 rate_limit_breaker: int = constants.RATE_LIMIT_BREAKER,
+                 language: str = 'ja'):
+        if language not in ('ja', 'zh'):
+            raise ValueError('仅支持日文与中文维基')
+        self.language = language
+        self.host = f'{language}.wikipedia.org'
+        self._zh_source = None
+        self._request_budget = None
         # ⚠️ 超时/重试**刻意从 30 秒 / 4 次降下来**（见 `constants.FETCH_HTTP_TIMEOUT`）。
         # ⚠️ 429（限流）另有自己的一套策略，见 `constants` 里「HTTP 429」那一节。
         self.http = client or HttpClient(
@@ -570,11 +586,17 @@ class WikipediaSource:
         self._detailed = False
         self._inspected_pages: dict[str, str] = {}
         self._page_titles: dict[str, str] = {}
+        self._page_variants: dict[str, list[str]] = {}
 
     def begin_round(self, on_rate_limit=None) -> None:
         """新任务不读取旧正文；本轮仍共享成功正文，HTTP等待与重试参数保留。"""
         self._wt_cache.clear()
         self._page_titles.clear()
+        self._page_variants.clear()
+        if self._zh_source is not None:
+            self._zh_source._wt_cache.clear()
+            self._zh_source._page_titles.clear()
+            self._zh_source._page_variants.clear()
         self.blocked_reason = ''
         getattr(self.http, '_rl_streak', {}).clear()
         getattr(self.http, '_rl_tripped', set()).clear()
@@ -584,28 +606,42 @@ class WikipediaSource:
         for key in self.stats:
             self.stats[key] = '' if key == 'last_error' else 0
 
-    def fetch_result(self, names: list[str]) -> ThemeFetchResult:
+    def fetch_result(self, names: list[str], *, title_jp: str = '', title_cn: str = '') -> ThemeFetchResult:
+        # 两种语言共用客户端、等待回调及单番预算；不能通过换语言绕过限流。
+        self._request_budget = {'remaining': 18}
+        first = self._fetch_single(list(dict.fromkeys(n for n in [title_jp, *names] if n)))
+        # 日文的范围歧义只说明该语言资料尚不能安全使用，仍可独立校验中文资料。
+        if self.language != 'ja' or first.reason_code not in ('article_not_found', 'no_theme_section', 'no_usable_themes', 'scope_ambiguous'):
+            first.diagnostics['language_results'] = [self._language_summary(first)]
+            return first
+        if self._zh_source is None:
+            self._zh_source = WikipediaSource(client=self.http, language='zh')
+        child = self._zh_source
+        child._request_budget = self._request_budget
+        second = child._fetch_single(list(dict.fromkeys(n for n in [title_cn, *names] if n)))
+        second.diagnostics['language_results'] = [self._language_summary(first), self._language_summary(second)]
+        second.message = '日文：' + first.message + '；中文：' + (second.message or '已取得可用 OP/ED')
+        if second.reason_code == 'article_not_found' and first.reason_code != 'article_not_found':
+            second.reason_code = first.reason_code
+            second.article_url = first.article_url
+        for key, value in child.stats.items():
+            if isinstance(value, int):
+                self.stats[key] += value
+                child.stats[key] = 0
+        return second
+
+    @staticmethod
+    def _language_summary(result: ThemeFetchResult) -> dict:
+        return dict(result.diagnostics, reason_code=result.reason_code, message=result.message,
+                    article_url=result.article_url)
+
+    def _fetch_single(self, names: list[str]) -> ThemeFetchResult:
         self._detailed = True
         self._inspected_pages = {}
         self._query_stage = '查找词条'
         try:
-            themes, page = self.fetch_themes(names)
-            canonical = self._page_titles.get(page, page)
-            url = f'https://{WIKI_HOST}/wiki/{quote(canonical.replace(" ", "_"))}' if canonical else ''
-            if themes:
-                return ThemeFetchResult(themes=themes, article_url=url,
-                                        diagnostics={'source_language': 'ja', 'query_stage': '解析主题歌'})
-            if self._inspected_pages:
-                page, text = next(iter(self._inspected_pages.items()))
-                has_section = any(theme_sections(t) for t in self._inspected_pages.values())
-                canonical = self._page_titles.get(page, page)
-                return ThemeFetchResult(
-                    article_url=f'https://{WIKI_HOST}/wiki/{quote(canonical.replace(" ", "_"))}',
-                    reason_code='no_usable_themes' if has_section else 'no_theme_section',
-                    message='未解析出可用 OP/ED' if has_section else '词条无主題歌栏目',
-                    diagnostics={'source_language': 'ja', 'query_stage': '解析主题歌'})
-            return ThemeFetchResult(reason_code='article_not_found', message='未找到匹配词条',
-                                    diagnostics={'source_language': 'ja', 'query_stage': '查找词条'})
+            from .wiki_matching import fetch_scoped
+            return fetch_scoped(self, names)
         except RateLimited as exc:
             deadline = time.time() + exc.retry_after if exc.retry_after is not None else 0
             return ThemeFetchResult(reason_code='rate_limited', message='维基请求被限流（HTTP 429）',
@@ -625,7 +661,9 @@ class WikipediaSource:
             cause = exc.__cause__
             timeout = isinstance(cause, TimeoutError) or isinstance(getattr(cause, 'reason', None), TimeoutError)
             timeout = timeout or 'timed out' in str(exc).lower()
-            code = 'timeout' if timeout else ('network_error' if isinstance(exc, HttpError) else 'parse_error')
+            code = 'timeout' if timeout else ('network_error' if isinstance(exc, HttpError) else
+                    'scope_ambiguous' if getattr(exc, 'error_code', '') == 'scope_ambiguous' else
+                    'lookup_budget_exceeded' if getattr(exc, 'error_code', '') == 'lookup_budget_exceeded' else 'parse_error')
             message = str(exc).strip() or ('维基请求超时' if timeout else '维基查询发生异常')
             return ThemeFetchResult(reason_code=code, message=f'{self._query_stage}：{message}',
                                    article_url=self._diagnostic_article(),
@@ -636,10 +674,10 @@ class WikipediaSource:
     def _diagnostic_article(self) -> str:
         page = next(iter(self._inspected_pages), '')
         canonical = self._page_titles.get(page, page)
-        return f'https://{WIKI_HOST}/wiki/{quote(canonical.replace(" ", "_"))}' if canonical else ''
+        return f'https://{self.host}/wiki/{quote(canonical.replace(" ", "_"))}' if canonical else ''
 
     def _error_diagnostics(self, exc: Exception) -> dict:
-        return {'source_language': 'ja', 'query_stage': self._query_stage,
+        return {'source_language': self.language, 'query_stage': self._query_stage,
                 'error_code': getattr(exc, 'error_code', type(exc).__name__),
                 'exception_type': type(exc).__name__,
                 'http_status': getattr(exc, 'status', 429 if isinstance(exc, RateLimited) else None),
@@ -658,12 +696,17 @@ class WikipediaSource:
         接着去试下一个 —— 真机那一次就这样把 62 个候选名全撞了一遍，
         28 个失败、84 次白发的请求、44.2 秒退避，一个都没成功。
         """
+        if self._detailed and self._request_budget is not None:
+            if self._request_budget['remaining'] <= 0:
+                raise WikiResponseError('本番维基查找请求预算已用尽，未继续扩展查询', 'lookup_budget_exceeded')
+            self._request_budget['remaining'] -= 1
         with self._lock:
             self.stats["api_calls"] += 1
         self._query_stage = ('搜索词条' if params.get('list') == 'search' else
-                             '读取词条正文' if params.get('prop') == 'revisions' or params.get('action') == 'parse'
+                             '读取词条正文' if 'revisions' in params.get('prop', '') or params.get('action') == 'parse'
                              else '查询维基 API')
-        url = WIKI_API + "?" + "&".join(
+        api = WIKI_API if self.language == 'ja' else f'https://{self.host}/w/api.php'
+        url = api + "?" + "&".join(
             f"{k}={_quote(v)}" for k, v in params.items()
         )
         try:
@@ -749,6 +792,10 @@ class WikipediaSource:
             "titles": "|".join(chunk),
             "redirects": 1, "format": "json", "formatversion": 2,
         }
+        if self.language == 'zh':
+            params['converttitles'] = 1
+            params['prop'] = 'revisions|info'
+            params['inprop'] = 'varianttitles'
         with self._lock:
             self.stats["titles_asked"] += len(chunk)
         try:
@@ -776,6 +823,7 @@ class WikipediaSource:
         # 词条，而我们的候选名是拼出来的。重定向同理 —— `redirects=1` 之前
         # 是 `action=parse` 自己跟的，换成 query 就得自己跟。
         norm = {m.get("from"): m.get("to") for m in (q.get("normalized") or [])}
+        norm.update({m.get('from'): m.get('to') for m in (q.get('converted') or [])})
         redir = {m.get("from"): m.get("to") for m in (q.get("redirects") or [])}
         out: dict[str, str | None] = {}
         for index, t in enumerate(chunk):
@@ -819,6 +867,8 @@ class WikipediaSource:
                     raise WikiResponseError('维基响应缺少正文', 'missing_content')
                 continue
             self._page_titles[t] = final
+            variants = p.get('varianttitles') or {}
+            self._page_variants[t] = list(variants.values()) if isinstance(variants, dict) else []
             self._wt_cache[t] = content
             with self._lock:
                 self.stats["page_hits"] += 1

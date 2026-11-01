@@ -472,13 +472,13 @@ class TestOrchestratorFallback(unittest.TestCase):
         """熔断之后第二次调用**不该再去碰维基**（否则又会白撞一轮）。"""
         src = WikipediaSource(client=FakeWikiClient(True), rps=0)
         calls = {"n": 0}
-        orig = src.fetch_themes
+        orig = src.http.get_json
 
-        def counting(names, **kw):
+        def counting(url, **kw):
             calls["n"] += 1
-            return orig(names, **kw)
+            return orig(url, **kw)
 
-        src.fetch_themes = counting
+        src.http.get_json = counting
         orch, _ = self._orch(src)
         orch._collect_themes(["X"], _pooled_at())
         first = calls["n"]

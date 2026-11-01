@@ -377,6 +377,8 @@ class AnimePage(BasePage):
 # ==================================================================== ② 曲目
 
 class ThemePage(BasePage):
+    confirm_type_requested = Signal(int, object, str)
+
     def __init__(self, rows: list[dict], missing: list[str], parent=None):
         cols = [
             Column("included", "收录", 52, "check", align=Qt.AlignCenter),
@@ -387,8 +389,11 @@ class ThemePage(BasePage):
             Column("artists", "艺人", 180, "text", editable=True),
             Column("origin_label", "来源", 66, "readonly", align=Qt.AlignCenter),
             Column("note", "备注", 220, "text", editable=True),
+            Column('source_language', '来源语言', 75, 'readonly'),
+            Column('article_url', '来源词条', 220, 'readonly'),
+            Column('source_section', '来源章节', 160, 'readonly'),
         ]
-        super().__init__(1, "② OP/ED 曲目确认", "日文维基百科 OP/ED · 点击匹配按钮后开始查询", cols, parent)
+        super().__init__(1, "② OP/ED 曲目确认", "日文维基优先，中文补充 · 点击匹配按钮后开始查询", cols, parent)
         self.next_btn.setText("确认曲目，下一步 →")
         self.missing = missing
         self.anime_choices: list[tuple[int, str]] = []
@@ -439,6 +444,23 @@ class ThemePage(BasePage):
         self.fetch_details.hide()
         self.details_toggle.toggled.connect(self.fetch_details.setVisible)
         left_layout.addWidget(self.fetch_details)
+        self.type_controls = QWidget()
+        type_layout = QVBoxLayout(self.type_controls)
+        type_layout.setContentsMargins(0, 0, 0, 0)
+        type_layout.addWidget(QLabel('已找到主题曲，OP/ED 类型待确认'))
+        self.untyped_combo = QComboBox()
+        self.type_combo = QComboBox()
+        self.type_combo.addItem('请选择 OP／ED', '')
+        self.type_combo.addItem('OP', 'OP')
+        self.type_combo.addItem('ED', 'ED')
+        self.confirm_type_btn = _btn('确认所选曲目类型')
+        self.confirm_type_btn.setEnabled(False)
+        self.type_combo.currentIndexChanged.connect(lambda *_: self.confirm_type_btn.setEnabled(bool(self.type_combo.currentData())))
+        self.confirm_type_btn.clicked.connect(self._confirm_type)
+        for widget in (self.untyped_combo, self.type_combo, self.confirm_type_btn):
+            type_layout.addWidget(widget)
+        left_layout.addWidget(self.type_controls)
+        self.type_controls.hide()
         self.scope_label = QLabel('全部番剧曲目')
         self.scope_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         scope = QHBoxLayout()
@@ -534,6 +556,8 @@ class ThemePage(BasePage):
         rows = []
         for state in self.fetch_states:
             row = dict(state, status_label=labels[state['status']])
+            if state['reason_code'] == 'type_unconfirmed':
+                row['status_label'] = '类型待确认'
             if state['reason_code'] == 'rate_limited':
                 row['status_label'] += ' · 限流'
             row['attempted_label'] = (datetime.fromtimestamp(state['attempted_at']).strftime('%Y-%m-%d %H:%M:%S')
@@ -563,6 +587,7 @@ class ThemePage(BasePage):
         self.fetch_table.setCurrentIndex(self.fetch_model.index(-1, -1))
         self.scope_label.setText('全部番剧曲目')
         self.fetch_details.clear()
+        self.type_controls.hide()
         self._apply_filter(self._view, log=False)
 
     def _select_anime(self, current, previous) -> None:
@@ -592,7 +617,8 @@ class ThemePage(BasePage):
         diag = row.get('diagnostics') or {}
         lines = [('番剧', row['anime']), ('状态', row['status_label']),
                  ('原因码', row.get('reason_code', '')), ('说明', row.get('message', '')),
-                 ('来源语言', '日文维基百科'), ('查询阶段', diag.get('query_stage', '')),
+                 ('来源语言', {'ja': '日文维基百科', 'zh': '中文维基百科'}.get(diag.get('source_language'), '未记录')),
+                 ('查询阶段', diag.get('query_stage', '')),
                  ('尝试次数', row.get('attempts', 0)), ('最近尝试', row.get('attempted_label', '')),
                  ('等待至', row.get('wait_label', '')), ('曲目数（含排除）', row.get('theme_count', 0))]
         lines.extend((key, diag[key]) for key in ('error_code', 'exception_type', 'http_status', 'api_code') if diag.get(key))
@@ -600,7 +626,23 @@ class ThemePage(BasePage):
         url = row.get('article_url', '')
         if url:
             text += f'<br><a href="{escape(url, quote=True)}">{escape(url)}</a>'
+        for result in diag.get('language_results', []):
+            text += '<br>' + escape(f"{result.get('source_language', '')}：{result.get('message') or '已取得曲目'} [{result.get('reason_code', '')}]")
+        for section in diag.get('sections', []):
+            text += '<br>来源章节：' + escape(section)
+        from ..sources.wikipedia import ATTRIBUTION
+        text += '<br>' + escape(ATTRIBUTION)
         self.fetch_details.setHtml(text)
+        self.untyped_combo.clear()
+        self.type_combo.setCurrentIndex(0)
+        for item in diag.get('untyped_themes', []):
+            self.untyped_combo.addItem(item['song_title'] + ' — ' + '、'.join(item['artists']), item)
+        self.type_controls.setVisible(row.get('reason_code') == 'type_unconfirmed' and self.untyped_combo.count() > 0)
+
+    def _confirm_type(self) -> None:
+        item = self.untyped_combo.currentData()
+        if self.selected_anime_id is not None and item and self.type_combo.currentData():
+            self.confirm_type_requested.emit(self.selected_anime_id, item, self.type_combo.currentText())
 
     def _refresh(self) -> None:
         # 统计条一律是**全量**口径（筛选只影响看到哪几行，不影响这些事实）。

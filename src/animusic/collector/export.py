@@ -92,6 +92,7 @@ class ExportCollector:
                     # 出处必须跟着数据走：没有这一列，把 CSV 转给别人就
                     # 等于把署名一起丢了（`Theme.source`，不是猜出来的）。
                     "source",
+                    'source_language', 'source_url', 'source_section',
                 ],
                 extrasaction="ignore",
             )
@@ -164,14 +165,14 @@ class ExportCollector:
         return (
             f"# {self.season_key} 数据来源与许可\n\n"
             f"> {ATTRIBUTION}\n\n"
-            "维基百科（日文）是本报告 OP/ED 曲目的**主数据源**，其正文以\n"
+            "维基百科（日文优先、中文补充）是本报告 OP/ED 曲目的**主数据源**，其正文以\n"
             "**CC BY-SA 4.0** 授权。**转发、再分发本报告（含 CSV / 歌单清单）时\n"
             "必须保留上面这行署名**，并以同样的许可分发衍生内容。\n\n"
             "## CSV 的 `source` 列是什么意思\n\n"
             "| `source` | 含义 | 许可 / 义务 |\n"
             "|---|---|---|\n"
-            "| `wikipedia` | 曲目取自日文维基百科「主題歌」栏（**主源**） | CC BY-SA 4.0，**必须署名** |\n"
-            "| `animethemes` | 维基没有对应词条时回落到 AnimeThemes | 见 animethemes.moe 的条款 |\n"
+            "| `wikipedia` | 曲目取自日文或中文维基百科；语言、词条和章节见 CSV 的 source_language、source_url、source_section 列 | CC BY-SA 4.0，**必须署名** |\n"
+            "| `animethemes` | 保留的历史 AnimeThemes 数据，当前匹配不再回退 | 见 animethemes.moe 的条款 |\n"
             "| `manual` | 人工补录 | 无第三方义务 |\n"
             "| 其它 | 见 `theme.source` 的原始值 | 以该来源的条款为准 |\n\n"
             f"本次计数：{listed}\n\n"
@@ -187,7 +188,7 @@ class ExportCollector:
         return (
             "\n---\n\n"
             f"**{ATTRIBUTION}**\n\n"
-            "曲目主数据源是日文维基百科（CC BY-SA 4.0）—— 再分发本清单时必须保留"
+            "曲目主数据源是维基百科（日文优先、中文补充，CC BY-SA 4.0）—— 再分发本清单时必须保留"
             "上面这行署名。逐条出处见 CSV 的 `source` 列，详见 `"
             f"{os.path.basename(stem)}_SOURCES.md`。\n"
         )

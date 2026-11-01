@@ -257,6 +257,7 @@ class WizardSession:
         for r in self.store.theme_list(sid, only_included=False):
             origin = Origin(r["origin"] or "animethemes")
             anime_on = anime_included.get(r["anime_id"], True)
+            source_info = json.loads(r['raw'] or '{}')
             rows.append({
                 "theme_id": r["id"],
                 "anime": r["anime_cn"] or r["anime_jp"] or "?",
@@ -268,6 +269,9 @@ class WizardSession:
                 "origin": str(origin),
                 "origin_label": ('维基' if r['source'] == 'wikipedia' and origin != Origin.MANUAL
                                  else _ORIGIN_LABEL.get(origin, str(origin))),
+                'source_language': {'ja': '日文', 'zh': '中文'}.get(source_info.get('source_language'), ''),
+                'article_url': source_info.get('article_url', ''),
+                'source_section': source_info.get('section', ''),
                 #: 这一行的番在①里有没有被纳入 —— 界面上「已排除」的计数要用它区分
                 #: 「这条曲目被排除了」和「它的番被排除了」（两者都表现为勾没打上）
                 "anime_included": anime_on,
@@ -453,6 +457,33 @@ class WizardSession:
                 self.store.mark_downstream_dirty(sid, Stage.ANIME)
         for r, aid in assigned:
             r["anime_id"] = aid
+
+    def confirm_wiki_type(self, anime_id: int, item: dict, kind: str) -> None:
+        states = {r['anime_id']: r for r in self.store.theme_fetch_rows(self.season_id) if r['included']}
+        state = states.get(anime_id)
+        if not state or state['reason_code'] != 'type_unconfirmed':
+            raise ValueError('当前番剧已没有待确认类型，请刷新后核对')
+        diag = dict(state['diagnostics'])
+        items = list(diag.get('untyped_themes', []))
+        if item not in items:
+            raise ValueError('待确认曲目已变化，请刷新后核对')
+        with self.store.transaction():
+            self.store.confirm_wiki_type(anime_id, item, kind)
+            tid = self.store.upsert_theme(anime_id, Theme(anime_id=anime_id, kind=ThemeKind(kind),
+                song_title=item['song_title'], artists=item['artists'], source='wikipedia', origin=Origin.SEARCH,
+                raw=dict(item, type_confirmed_by='human')))
+            items.remove(item)
+            diag['untyped_themes'] = items
+            ids = set(diag.get('accepted_theme_ids', [])) | {tid}
+            diag['accepted_theme_ids'] = sorted(ids)
+            diag.setdefault('confirmed_types', []).append(dict(item, kind=kind, confirmed_by='human'))
+            self.store.set_theme_fetch(anime_id, 'failed' if items else 'success',
+                reason_code='type_unconfirmed' if items else '',
+                message='已找到主题曲，OP/ED 类型待确认' if items else '主题曲类型已由用户确认',
+                article_url=state['article_url'], retry_not_before=state['retry_not_before'],
+                saved_count=len(ids), diagnostics=diag)
+            self.store.mark_downstream_dirty(self.season_id, Stage.THEME)
+            self.store.set_stage(self.season_id, Stage.THEME, StageStatus.FETCHED, fetched=True)
 
     def save_themes(self, rows: list[dict], *, confirm: bool = True) -> None:
         """整页原子保存；缺席行不等于删除，排除必须由 included 明确表达。"""

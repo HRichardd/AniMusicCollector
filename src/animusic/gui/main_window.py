@@ -1138,6 +1138,7 @@ class MainWindow(QMainWindow):
                          "只重新查询失败番剧，跳过成功和待抓取项目", index=2)
         theme.btn_stop = theme.add_action('停止匹配', self._stop_task, index=3)
         theme.btn_stop.setEnabled(False)
+        theme.confirm_type_requested.connect(self._confirm_wiki_type)
 
         match.add_action("开始匹配网易云", self._run_match, "primary",
                          "对每条曲目搜索并打分（后台执行）", index=0)
@@ -1380,6 +1381,18 @@ class MainWindow(QMainWindow):
 
     def _fetch_themes(self) -> None:
         self._start_theme_fetch('refresh_themes', '匹配全部番剧曲名')
+
+    def _confirm_wiki_type(self, anime_id: int, item: dict, kind: str) -> None:
+        if self._closing or (self.worker is not None and self.worker.isRunning()):
+            return
+        try:
+            self.session.save_themes(self.pages[1].all_rows(), confirm=False)
+            self.session.confirm_wiki_type(anime_id, item, kind)
+        except Exception as exc:
+            self.log(f'主题曲类型确认失败：{exc}')
+            self.status.showMessage(f'主题曲类型确认失败：{exc}')
+            return
+        self.reload(f'已确认主题曲类型：{item["song_title"]} → {kind}')
 
     def _fetch_pending_themes(self) -> None:
         self._start_theme_fetch('fetch_pending_themes', '匹配待抓取番剧')

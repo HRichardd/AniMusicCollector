@@ -194,7 +194,7 @@ class TestPushPlan(unittest.TestCase):
     def test_manual_theme_to_confirmed_song_to_push_plan(self):
         from animusic.gui.widgets import Column, DictTableModel
         model = DictTableModel([Column("song_title", "曲名")])
-        stub = SimpleNamespace(anime_choices=[(self.aid, "番")], model=model, log=SimpleNamespace(emit=Mock()),
+        stub = SimpleNamespace(anime_choices=[(self.aid, "番")], selected_anime_id=None, model=model, log=SimpleNamespace(emit=Mock()),
                                table=SimpleNamespace(scrollToBottom=Mock(), edit=Mock()), _view="全部", _apply_filter=Mock())
         ThemePage._add(stub)
         model.rows[0].update(song_title="数据源没有的歌", artists=["测试艺人"])
@@ -405,7 +405,7 @@ class TestManualFlowWithoutWindows(unittest.TestCase):
 
     def test_new_theme_resolves_same_name_anime_by_id_and_stubs_picker(self):
         model = SimpleNamespace(add_row=Mock(return_value=0), index=lambda *a: None)
-        stub = SimpleNamespace(anime_choices=[(1, "同名番"), (2, "同名番")], model=model, log=SimpleNamespace(emit=Mock()),
+        stub = SimpleNamespace(anime_choices=[(1, "同名番"), (2, "同名番")], selected_anime_id=None, model=model, log=SimpleNamespace(emit=Mock()),
                                table=SimpleNamespace(scrollToBottom=Mock(), edit=Mock()), _view="全部", _apply_filter=Mock())
         with patch.object(QInputDialog, "getItem", return_value=("同名番（选项2）", True)) as picker:
             ThemePage._add(stub)

@@ -192,6 +192,31 @@ class TestGuiFlow(unittest.TestCase):
         task.assert_not_called()
         self.win.worker = None
 
+    def test_wiki_unknown_type_confirmation_is_explicit_and_preserves_hidden_edit(self):
+        aid, tid, _ = self._seed()
+        item = dict(song_title='未分类主题曲', artists=['歌手乙'], raw='歌：歌手乙',
+                    source_language='zh', article_url='https://zh.wikipedia.org/wiki/测试番', section='主題曲')
+        self.store.set_theme_fetch(aid, 'failed', reason_code='type_unconfirmed',
+            message='已找到主题曲，OP/ED 类型待确认', article_url=item['article_url'],
+            diagnostics={'source_language': 'zh', 'untyped_themes': [item]})
+        self.win.reload()
+        page = self.win.pages[1]
+        page.all_rows()[0]['song_title'] = '隐藏行的人工修改'
+        page._apply_filter('仅 ED', log=False)
+        page.fetch_table.setCurrentIndex(page.fetch_model.index(0, 0))
+        self.assertEqual(len(self.store.theme_list(self.sess.season_id)), 1)
+        self.assertIn('中文维基', page.fetch_details.toPlainText())
+        self.assertFalse(page.type_controls.isHidden())
+        page.type_combo.setCurrentText('ED')
+        page.confirm_type_btn.click()
+        rows = self.store.theme_list(self.sess.season_id, False)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(next(r for r in rows if r['id'] == tid)['song_title'], '隐藏行的人工修改')
+        created = next(r for r in rows if r['id'] != tid)
+        self.assertEqual((created['kind'], created['song_title']), ('ED', '未分类主题曲'))
+        self.assertEqual(self.store.theme_fetch_rows(self.sess.season_id)[0]['status'], 'success')
+        self.assertTrue(page.type_controls.isHidden())
+
     def test_stop_available_with_status_message_and_page_busy(self):
         from unittest.mock import Mock
         self.win.stack.setCurrentIndex(1)
