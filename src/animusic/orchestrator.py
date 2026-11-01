@@ -1,13 +1,13 @@
 """流程编排 —— 把各层串成两条主流程。
 
     fetch_anime_list  向导第一步：读 Bangumi「在看」→ 按季度筛选 → 只保存番单
-    fetch_season   旧 CLI 综合抓取：读 Bangumi → 匹配来源 → 落库番剧与曲目
+    fetch_season   CLI 综合抓取：只保存 Bangumi 番单 → 仅维基曲名匹配
+    refresh_themes 向导第二步：全部 / 待抓取 / 失败，按番剧持久化结果
     match_season   对每条 theme 构造搜索词 → 搜网易云 → 打分 → 落库候选与决策
     export         产出报告（CSV / 导入清单 / 缺失清单）
 
 设计要点：
-    · 番剧匹配要处理**跨书写系统**（Bangumi 中日文名 vs AnimeThemes 罗马音），
-      因此复用 normalize.name_similarity 的罗马音比较
+    · 曲目只来自日文维基；历史名称匹配辅助函数不再用于曲目抓取入口
     · 季度筛选在番单层完成；来源没有单首曲目的季度信息，保留已确认番剧的 OP/ED
     · 增量：默认跳过已有决策的 theme；`retry_missing` 只重试
       missing_source / missing_netease，不碰 missing_match（§5.12）
@@ -42,7 +42,7 @@ from .normalize import AliasTable, name_similarity, normalize_text
 from .query_builder import build_queries
 from .sources.animethemes import AnimeThemesSource, AtAnime
 from .sources.bangumi import BangumiSource
-from .sources.wikipedia import WIKI_TRY_BATCH, WikipediaSource
+from .sources.wikipedia import WIKI_TRY_BATCH, WikipediaSource, ThemeFetchResult
 from .store import Store, ThemeIdentityConflict
 
 Progress = Callable[[str], None]
@@ -383,14 +383,13 @@ class Orchestrator:
         self._slow_seconds = fetch_cfg.slow_request_seconds
         #: 维基被**限流熔断**之后就不再查它了（空 = 没被限流）。
         #: 为什么不继续查：实测配额只有约 6~9 次请求/窗口，继续撞只会让
-        #: 配额更晚恢复；而且剩下的番用 AnimeThemes 回退源也能出曲目。
+        #: 配额更晚恢复；未处理的番留为待抓取，不使用其它曲目源。
         self._wiki_blocked = ""
 
         self.animethemes = AnimeThemesSource(
             cache_ttl=fetch_cfg.animethemes_cache_ttl, **self._http_kw
         )
-        # 维基响应缓存：查询限速 1 请求/秒，而一部番要试多种词条名 ——
-        # 不开缓存的话每次重跑都要把这几分钟重新花一遍（用户实测就是这个）。
+        # 旧读取接口仍兼容缓存配置；匹配任务每轮刷新，只复用同轮正文。
         self.wikipedia = WikipediaSource(
             cache_ttl=fetch_cfg.wikipedia_cache_ttl, **self._http_kw
         )
@@ -549,7 +548,7 @@ class Orchestrator:
                 lines.append(f"    ! {e}")
         return lines
 
-    # ---- 曲目来源：维基优先，AnimeThemes 回退
+    # ---- 曲目来源：仅日文维基，结构化失败结果
 
     def _save_fetched_theme(self, anime_id: int, theme: Theme) -> bool:
         try:
@@ -559,71 +558,35 @@ class Orchestrator:
             return False
         return True
 
-    def _collect_themes(self, names: list[str], at: AtAnime | None) -> tuple[list[dict], str]:
-        """给一部番取 OP/ED。返回 (曲目列表, 来源说明)。
+    def _wiki_result(self, names: list[str]) -> ThemeFetchResult:
+        detailed = getattr(self.wikipedia, 'fetch_result', None)
+        if detailed is not None:
+            return detailed(names)
+        # 保留只实现旧读取接口的离线来源适配；正式来源始终走结构化结果。
+        try:
+            themes, page = self.wikipedia.fetch_themes(names)
+            return ThemeFetchResult(themes=themes,
+                                    article_url=f'https://ja.wikipedia.org/wiki/{page}' if page else '',
+                                    reason_code='' if themes else 'no_usable_themes',
+                                    message='' if themes else '未解析出可用 OP/ED')
+        except RateLimited as exc:
+            return ThemeFetchResult(reason_code='rate_limited', message='维基请求被限流（HTTP 429）',
+                                    stopped=exc.breaker,
+                                    retry_not_before=time.time() + exc.retry_after if exc.retry_after is not None else 0)
 
-        **维基优先**（用户的提议，实测收益很大）：
-            AnimeThemes 只有罗马音，而网易云索引的是日文原名 ——
-            这个错配是最大的准确率损失来源（G.9/G.10 实测）。
-            维基的主题歌栏直接给日文原名 + 艺人，从源头消掉问题。
-
-        实测对比（2026Q4 那 5 部在看番，只用 Bangumi 的日文名，零罗马音）：
-            维基        5/5
-            AnimeThemes 2/5（还要靠 AniList 桥接才到 2/5）
-        且维基拿到了 AnimeThemes 完全匹配不上的跨季番
-        （`欺诈游戏 → LIAR GAME`、`遭到流放的转生重骑士…`）。
-
-        **回退仍然必要**：维基不是每部番都有词条（实测 `名探偵プリキュア！`
-        就是靠全角/半角修正才找到的；总有真的没有的）。
-
-        **被限流熔断时**（必修 1）：直接跳到回退源，并且**明确告诉用户
-        「是我们被限流了」而不是「维基没收录」** —— 后者会让人去手动补数据，
-        补的还是本来能自动拿到的曲目。
-        """
-        # ---- 主路径：维基（熔断之后不再向它发请求）
-        blocked = getattr(self, "_wiki_blocked", "")
+    def _collect_themes(self, names: list[str], at: AtAnime | None = None) -> tuple[list[dict], str]:
+        """兼容旧调用签名，任何情况下都不再读取备用曲目源。"""
+        if getattr(self, '_wiki_blocked', ''):
+            return [], 'none'
         self._check_cancelled()
-        if blocked:
-            wikis, page = [], ""
-        else:
-            try:
-                wikis, page = self.wikipedia.fetch_themes(names)
-            except RateLimited as e:
-                # 只有熔断（breaker=True）会冒到这里 —— 单次 429 在
-                # `WikipediaSource._api` 里就被记成「没问到」了
-                reason = (f"HTTP 429，服务端要求等待 {e.retry_after:.0f} 秒"
-                          if e.retry_after is not None else "HTTP 429（限流）")
-                self._wiki_blocked = reason
-                self.progress(
-                    f"    ⚠ 维基开始限流（{reason}）—— **停止**本步对维基的查询，"
-                    f"剩下的番改用 AnimeThemes 回退源"
-                )
-                self.progress(
-                    "      ⚠ 注意：这**不是「维基没收录」**，是我们被限流了。"
-                    "换一个节点，或过几分钟重跑即可补齐"
-                )
-                wikis, page = [], ""
-            except Exception as e:  # noqa: BLE001 - 维基挂了不该让整季失败
-                self.progress(f"    维基查询失败，回退 AnimeThemes：{e}")
-                wikis, page = [], ""
+        result = self._wiki_result(names)
         self._check_cancelled()
-        if wikis:
-            return (
-                [{"kind": t.kind, "song_title": t.song_title, "artists": t.artists,
-                  "sequence": t.sequence, "note": t.note}
-                 for t in wikis],
-                f"wikipedia:{page}",
-            )
-
-        # ---- 回退：AnimeThemes
-        if at is not None:
-            return (
-                [{"kind": t.kind, "song_title": t.song_title, "artists": t.artists,
-                  "sequence": t.sequence, "note": ""}
-                 for t in at.themes],
-                f"animethemes:{at.slug}",
-            )
-        return [], "none"
+        if result.stopped:
+            self._wiki_blocked = result.message
+            self.progress('维基限流，停止本轮请求；这不是「维基没收录」')
+        return ([{'kind': t.kind, 'song_title': t.song_title, 'artists': t.artists,
+                  'sequence': t.sequence, 'note': t.note} for t in result.themes],
+                f'wikipedia:{result.article_url}' if result.themes else 'none')
 
     # ================================================================ 番单
 
@@ -662,337 +625,122 @@ class Orchestrator:
                            subjects_in_season=len(picked), read_path=result.path)
 
     def fetch_season(self, season: Season, retry_missing: bool = False) -> FetchReport:
-        t0 = time.monotonic()
-        rep = FetchReport(season=season)
-        sid = self.store.get_season_id(season.year, season.quarter)
-        self.store.set_stage(sid, Stage.ANIME, StageStatus.FETCHED, fetched=True)
-        #: 落库前先拍快照 —— 「新增了多少」必须**从库里数差值**，不能数流程里的
-        #: upsert 次数：那会把「更新已有行」也算成新增，两首同曲名合并成一行时
-        #: 还会虚报（`update_season` 用的就是这个办法，见 SeasonSnapshot 的注释）。
-        before = SeasonSnapshot.take(self.store, sid)
-        #: upsert 的**次数**（可能大于新增行数），只用来在日志里说明差在哪
-        written = 0
-
-        # ---- 1. 读 Bangumi 在看
-        self.progress("读取 Bangumi「在看」列表…")
-        result = self.bangumi.read_watching()
-        rep.read_path = result.path
-        rep.subjects_total = len(result.subjects)
-        self.progress(f"  路径={result.path}，共 {len(result.subjects)} 条")
-
-        # ---- 2. 按季度筛选
-        picked = BangumiSource.filter_by_season(
-            result.subjects, season, self.config.bangumi.include_cross_season
-        )
-        rep.subjects_in_season = len(picked)
-        self.progress(f"  属于 {season.key} 的 {len(picked)} 条")
-
-        # ---- 3. 拉 AnimeThemes 当季池
-        #
-        # ⚠️ 这个池子是**给番找名字用的**（以及维基没有时回退曲目），
-        # **不会**变成番单。日志必须写清这件事 —— 用户看到「当季 49 部」
-        # 而自己在看列表只有 5 部，会以为工具背着他把一整季都收进来了。
-        self.progress("拉取 AnimeThemes 当季番单（只用于匹配名字与回退曲目，**不会加入番单**）…")
-        pool = self._at_pool(season)
-        self.progress(f"  当季 {len(pool)} 部（匹配池）")
-
-        # ---- 4. 逐条匹配
-        for subject, bucket in picked:
-            self._check_cancelled()
-            m = self._match_anime(subject, bucket, pool, season)
-            if m.at_anime is None:
-                rep.unmatched.append(m)
-                continue
-            rep.matched.append(m)
-        self.progress(
-            f"  AnimeThemes 名称匹配上 {len(rep.matched)}/{len(picked)} 部"
-            + (f"（池子里另外 {len(pool) - len(rep.matched)} 部与你在看的番无关，不会入库）"
-               if len(pool) > len(rep.matched) else ""))
-
-        # ---- 5. 落库
-        wiki_used = 0
-        at_used = 0         # 曲目来自 AnimeThemes 回退源的番数（限流时它会变大）
-        with_themes = 0     # 真正写入 ≥1 条曲目的番数（见 subjects_with_themes 的说明）
-        # ---- 6. 落库。
-        #
-        # ⚠️ **两个来源统一处理**：对每一部番都先试维基，再回退 AnimeThemes。
-        #
-        # 一开始我把维基只放在「AnimeThemes 匹配上」的分支里，结果那 5 部
-        # 只看拿到 2 部 —— 因为另外 3 部（欺诈游戏、遭到流放的转生重骑士、
-        # 名侦探光之美少女！）**根本不需要 AnimeThemes 匹配**：
-        # 维基凭 Bangumi 的日文名就能直接找到它们的主题歌。
-        #
-        # 教训：换了主数据源之后，「什么算匹配上」的判据也要跟着改 ——
-        # AnimeThemes 匹配不上 ≠ 这部番没有曲目。
-        for m in list(rep.matched) + list(rep.unmatched):
-            self._check_cancelled()
-            at = m.at_anime
-            themes, source = self._collect_themes(m.subject_names, at)
-            if source.startswith("wikipedia:"):
-                wiki_used += 1
-            elif source.startswith("animethemes:"):
-                at_used += 1
-
-            if not themes:
-                # 两个源都没有 → 写占位行，等人工补。
-                # 搜索**失败**时不要写「未收录」—— 那是我们没问到，
-                # 不是数据源没有，写了会让用户误以为要手动补（见附录 G.11）。
-                note = ("匹配时搜索失败，未能确认数据源是否收录 —— 建议重跑"
-                        if m.how == "search_failed"
-                        else "维基与 AnimeThemes 都没有收录 —— 可手动补充曲目")
-                self.store.upsert_anime(sid, Anime(
-                    season_key=season.key, title_cn=m.title_cn,
-                    title_jp=m.subject_names[1] if len(m.subject_names) > 1 else None,
-                    bgm_id=self._subject_bgm(m, picked),
-                    air_date=self._subject_air_date(m, picked),
-                    season_bucket=m.bucket, origin=Origin.BANGUMI,
-                    included=True, note=note,
-                ))
-                continue
-
-            anime_id = self.store.upsert_anime(sid, Anime(
-                season_key=season.key,
-                title_cn=m.title_cn,
-                title_jp=m.subject_names[1] if len(m.subject_names) > 1 else None,
-                title_romaji=at.name if at else None,
-                animethemes_slug=at.slug if at else None,
-                # ⚠️ **必须带 bgm_id**，否则同一部番在不同轮次间合不到一行
-                # （上一轮未匹配写 (bgm_id=X, slug=NULL)，这一轮匹配写
-                # (bgm_id=NULL, slug=Y)，两个键都不同 → 界面上出现重复行）。
-                bgm_id=self._subject_bgm(m, picked),
-                air_date=self._subject_air_date(m, picked),
-                season_bucket=m.bucket, origin=Origin.BANGUMI, included=True,
-                note=f"番剧匹配={m.how}({m.score:.2f}) 曲目源={source}",
-            ))
-            wrote = 0
-            for t in themes:
-                if not t.get("song_title"):
-                    continue
-                if not self._save_fetched_theme(anime_id, Theme(
-                    anime_id=anime_id, kind=t["kind"],
-                    song_title=t["song_title"],
-                    artists=t.get("artists") or [],
-                    sequence=t.get("sequence"),
-                    source=source.split(":")[0],
-                    origin=(Origin.ANIMETHEMES
-                            if source.startswith("animethemes") else Origin.SEARCH),
-                    included=True, note=t.get("note") or "",
-                )):
-                    continue
-                written += 1
-                wrote += 1
-            # 数「真的写进去了曲目」的番，而不是「匹配上了的番」：
-            # 一部番可以匹配上 AnimeThemes 却两边都没曲目，也可以匹配不上
-            # 却从维基拿到整季 OP/ED。只有写入计数不会骗人。
-            if wrote:
-                with_themes += 1
-
-        # ---- 6. 收尾：数字一律**从库里数差值**，不数流程计数器
-        after = SeasonSnapshot.take(self.store, sid)
-        added = len(after.theme_ids - before.theme_ids)
-        rep.themes_added = added
-        rep.themes_written = written
-        rep.subjects_with_themes = with_themes
-        if wiki_used:
-            self.progress(f"  其中 {wiki_used} 部的曲目来自维基百科")
-
-        self.store.set_stage(sid, Stage.ANIME, StageStatus.CONFIRMED, confirmed=True)
-
-        # ⚠️ 这一行曾经打的是「匹配 {len(rep.matched)}/{...}」—— 那是
-        # **AnimeThemes 的名称匹配数**，在维基成为曲目主源之后它不再等于成功率：
-        # 用户那次 5 部全部从维基拿到了曲目，日志却说「匹配 2/5」，
-        # 看起来像 3 部失败了（见 DESIGN.md G.18）。
-        # 现在打的是`subjects_with_themes`（真的写入 ≥1 条曲目的番数）。
-        self.progress(
-            f"完成：{rep.subjects_with_themes}/{rep.subjects_in_season} 部拿到曲目"
-            + (f"（维基 {wiki_used} 部）" if wiki_used else "")
-            + f"，新增曲目 {added} 条"
-            + (f"（另有 {written - added} 条是更新已有行）" if written > added else "")
-        )
-        matched_total = len(rep.matched) + len(rep.unmatched)
-        if matched_total and len(rep.matched) != rep.subjects_with_themes:
-            self.progress(
-                f"  注：AnimeThemes 只匹配上 {len(rep.matched)}/{matched_total} 部 —— "
-                "它现在只是**回退源**，没匹配上不代表这部番没有曲目"
-            )
-        if getattr(self, "_wiki_blocked", ""):
-            self.progress(
-                f"⚠ 维基曲目源本步被限流中止（{self._wiki_blocked}）："
-                f"有 {at_used} 部的曲目来自 AnimeThemes **回退源**（罗马音，"
-                f"到网易云的匹配可用率更低）。换节点或过几分钟重跑一次可以补齐"
-            )
-        # 「时间花在哪」紧跟主结果行 —— 用户抱怨的正是「慢」，那就要在慢的
-        # 那一步把账摊开，而不是等他去翻日志文件。
-        for line in self._timing_lines(time.monotonic() - t0):
-            self.progress(line)
+        """旧 CLI 入口复用番单保存及仅维基曲目任务，不再加载其它曲目源。"""
+        listing = self.fetch_anime_list(season)
+        rep = self.refresh_themes(season, mode='failed' if retry_missing else 'all')
+        rep.read_path = listing.read_path
+        rep.subjects_total = listing.subjects_total
         return rep
-
-    # ---------------------------------------------------------------- 番单：不经 Bangumi
 
     def fetch_season_from_animethemes(
         self, season: Season, limit: int | None = None, bridge_names: bool = True
     ) -> FetchReport:
-        """直接以 AnimeThemes 当季番单作为输入，**不读 Bangumi**。
+        raise NotImplementedError('当季全部来源待定；请使用 Bangumi 番单或手动新增番剧，再匹配维基曲名')
 
-        两个正当用途（不是测试专用）：
-            ① Bangumi 读不了时的降级 —— 浏览器没接管、未登录、站点抽风
-            ② 想「先把整季的 OP/ED 都收进来」再挑要看哪些，
-               而不是只收「在看」的番
+    def fetch_pending_themes(self, season: Season) -> FetchReport:
+        return self.refresh_themes(season, mode='pending')
 
-        用 AniList 的 `title.native` 补日文原名。
-        这不是锦上添花：实测缺了日文名会让 `{番剧名} 片头曲` 这类查询失效，
-        匹配可用率**显著偏低**（附录 G.9 的测量偏差修正）。
-        """
-        rep = FetchReport(season=season)
+    def retry_failed_themes(self, season: Season) -> FetchReport:
+        return self.refresh_themes(season, mode='failed')
+
+    def refresh_themes(self, season: Season, mode: str = 'all') -> FetchReport:
+        """一次点击对应一轮；曲目和该番结果在同一事务中提交。"""
+        if mode not in ('all', 'pending', 'failed'):
+            raise ValueError('未知曲名匹配范围')
         sid = self.store.get_season_id(season.year, season.quarter)
-        rep.read_path = "animethemes"
-        self.store.set_stage(sid, Stage.ANIME, StageStatus.FETCHED, fetched=True)
-        # 同 `fetch_season`：新增数从库里的差值数出来，不数 upsert 次数
-        before = SeasonSnapshot.take(self.store, sid)
-        t0 = time.monotonic()
-
-        self.progress("拉取 AnimeThemes 当季番单…")
-        animes = [a for a in self.animethemes.fetch_season(season) if a.themes]
-        rep.subjects_total = len(animes)
-        if limit:
-            animes = animes[:limit]
-            rep.subjects_total = len(animes)
-        rep.subjects_in_season = len(animes)
-        self.progress(f"  当季有 OP/ED 的 {len(animes)} 部")
-
-        native: dict[str, str] = {}
-        if bridge_names:
-            native = self._native_titles(season, animes)
-            self.progress(f"  AniList 补到 {len(native)}/{len(animes)} 部的日文原名")
-
-        written = 0
-        with_themes = 0
-        for a in animes:
-            self._check_cancelled()
-            anime_id = self.store.upsert_anime(sid, Anime(
-                season_key=season.key,
-                title_romaji=a.name,
-                title_jp=native.get(a.name) or None,
-                animethemes_slug=a.slug,
-                season_bucket=SeasonBucket.TARGET,
-                origin=Origin.ANIMETHEMES,
-                included=True,
-                note="来自 AnimeThemes 当季番单",
-            ))
-            wrote = 0
-            for t in a.themes:
-                if not t.song_title:
-                    continue
-                if not self._save_fetched_theme(anime_id, Theme(
-                    anime_id=anime_id, kind=t.kind, song_title=t.song_title,
-                    artists=t.artists, sequence=t.sequence, source="animethemes",
-                    origin=Origin.ANIMETHEMES, included=True,
-                )):
-                    continue
-                written += 1
-                wrote += 1
-            if wrote:
-                with_themes += 1
-
-        added = len(SeasonSnapshot.take(self.store, sid).theme_ids - before.theme_ids)
-        rep.themes_added = added
-        rep.themes_written = written
-        rep.subjects_with_themes = with_themes
-        self.store.set_stage(sid, Stage.ANIME, StageStatus.CONFIRMED, confirmed=True)
-        self.progress(
-            f"完成：{len(animes)} 部番，{rep.subjects_with_themes} 部拿到曲目，"
-            f"新增曲目 {added} 条"
-            + (f"（另有 {written - added} 条是更新已有行）" if written > added else "")
-        )
-        for line in self._timing_lines(time.monotonic() - t0):
-            self.progress(line)
-        return rep
-
-    def refresh_themes(self, season: Season) -> FetchReport:
-        """**只更新当前番单的曲目** —— 不新增任何番、不碰「当季全季」。
-
-        为什么要有它（用户实测报的问题②）：第②步的「拉取 / 更新 OP/ED」原来接的是
-        `fetch_season_from_animethemes`（= 第①步那个"仅从 AnimeThemes 拉当季"）。
-        那个按设计会把**整季**番写进番单 —— 于是"更新曲目"实际上变成了"换一季番单"：
-        用户点一下，番单里凭空多出几十部没在看的番。
-
-        这个方法的边界很明确：
-
-          · 处理对象 = **库里已纳入的番**（`anime_list(sid)`，即①里勾着的那些）
-          · 只 upsert 曲目；**不新增番**、不改 `anime.included`、不删任何东西
-          · 手工行照旧受保护：`upsert_theme` 不会覆盖 `origin='manual'` 的字段，
-            也不碰 `included`/`note`（用户自己的取舍不会被重跑冲掉）
-          · 数字口径见 G.18：新增数从**库里**数差值，不数 upsert 次数
-        """
-        rep = FetchReport(season=season)
-        sid = self.store.get_season_id(season.year, season.quarter)
-        before = SeasonSnapshot.take(self.store, sid)
-        rep.read_path = "included-anime"
-        t0 = time.monotonic()
-
-        animes = self.store.anime_list(sid)
-        rep.subjects_total = len(animes)
-        rep.subjects_in_season = len(animes)
-        self.progress(f"更新曲目：番单里 {len(animes)} 部（只碰这些，不会拉当季全季）")
+        states = {r['anime_id']: r for r in self.store.theme_fetch_rows(sid)}
+        animes = [a for a in self.store.anime_list(sid)
+                  if mode == 'all' or states[a['id']]['status'] == mode]
+        rep = FetchReport(season=season, subjects_total=len(animes),
+                          subjects_in_season=len(animes), read_path='included-anime')
+        self.progress(f'维基曲名匹配：本轮 {len(animes)} 部（{mode}，只处理纳入番剧）')
         if not animes:
-            self.progress("  番单是空的 —— 请先在第①步拉取番单")
+            self.progress('无符合条件的番剧，无需查询')
             return rep
-
-        pool = {a.slug: a for a in self._at_pool(season)}
-        wiki_used = 0
-        at_used = 0
-        written = 0
-        with_themes = 0
-        for i, a in enumerate(animes, 1):
-            self._check_cancelled()
-            name = a["title_cn"] or a["title_jp"] or a["title_romaji"] or "?"
-            # 每部都报进度：维基限速 1 请求/秒，几部番就是几十秒 ——
-            # 不报进度的话用户只会觉得"卡住了"。
-            self.progress(f"  第 {i}/{len(animes)} 部：{name}…")
-            names = [x for x in (a["title_cn"], a["title_jp"], a["title_romaji"]) if x]
-            themes, source = self._collect_themes(names, pool.get(a["animethemes_slug"]))
-            if source.startswith("wikipedia:"):
-                wiki_used += 1
-            elif source.startswith("animethemes:"):
-                at_used += 1
-            wrote = 0
-            for t in themes:
-                if not t.get("song_title"):
-                    continue
-                if not self._save_fetched_theme(a["id"], Theme(
-                    anime_id=a["id"], kind=t["kind"],
-                    song_title=t["song_title"],
-                    artists=t.get("artists") or [],
-                    sequence=t.get("sequence"),
-                    source=source.split(":")[0],
-                    origin=(Origin.ANIMETHEMES
-                            if source.startswith("animethemes") else Origin.SEARCH),
-                    included=True, note=t.get("note") or "",
-                )):
-                    continue
-                written += 1
-                wrote += 1
-            if wrote:
-                with_themes += 1
-
+        deadline = self.store.source_wait_until()
+        if deadline > time.time():
+            self.progress(f'服务端等待期限未到，尚需等待 {deadline - time.time():.0f} 秒；本轮未发起查询')
+            return rep
+        before = SeasonSnapshot.take(self.store, sid)
+        t0 = time.monotonic()
+        self._wiki_blocked = ''
+        begin = getattr(self.wikipedia, 'begin_round', None)
+        if begin is not None:
+            begin(on_rate_limit=self.store.save_source_wait)
+        finished: set[int] = set()
+        pending_message = '本轮尚未完成，待重新查询'
+        try:
+            for i, a in enumerate(animes, 1):
+                self._check_cancelled()
+                aid = a['id']
+                self.store.set_theme_fetch(aid, 'running', start=True)
+                self.progress(f'第 {i}/{len(animes)} 部：{a["title_cn"] or a["title_jp"] or a["title_romaji"] or "?"}…')
+                names = [x for x in (a['title_cn'], a['title_jp'], a['title_romaji']) if x]
+                result = None
+                try:
+                    result = self._wiki_result(names)
+                    self._check_cancelled()
+                    if result.retry_not_before:
+                        self.store.save_source_wait(result.retry_not_before)
+                    if result.reason_code:
+                        self.store.set_theme_fetch(
+                            aid, 'failed', reason_code=result.reason_code, message=result.message,
+                            article_url=result.article_url, retry_not_before=result.retry_not_before)
+                    else:
+                        # 一部番的任意保存冲突都会回滚该番，避免半成功与成功状态不一致。
+                        with self.store.transaction():
+                            theme_ids = set()
+                            previous = [dict(t) for t in self.store.theme_list(sid, only_included=False)]
+                            for theme in result.themes:
+                                self._check_cancelled()
+                                theme_ids.add(self.store.upsert_theme(aid, Theme(
+                                    anime_id=aid, kind=theme.kind, song_title=theme.song_title,
+                                    artists=theme.artists, sequence=theme.sequence,
+                                    source='wikipedia', origin=Origin.SEARCH,
+                                    included=True, note=theme.note or '')))
+                            self._check_cancelled()
+                            self.store.set_theme_fetch(aid, 'success', article_url=result.article_url,
+                                                       saved_count=len(theme_ids))
+                            current = [dict(t) for t in self.store.theme_list(sid, only_included=False)]
+                            if current != previous:
+                                self.store.mark_downstream_dirty(sid, Stage.THEME)
+                                self.store.set_stage(sid, Stage.THEME, StageStatus.FETCHED, fetched=True)
+                        rep.themes_written += len(result.themes)
+                    finished.add(aid)
+                    if result.reason_code:
+                        self.progress(f'  失败：{result.message} [{result.reason_code}]')
+                    if result.stopped or self.store.source_wait_until() > time.time():
+                        pending_message = '本轮因限流未查询，待服务端等待期限满足后继续'
+                        self.progress('限流或服务端等待要求使本轮停止；未轮到的番剧保留待抓取')
+                        break
+                except OperationCancelled:
+                    raise
+                except Exception as exc:
+                    self.store.set_theme_fetch(aid, 'failed',
+                                               reason_code='save_conflict' if result is not None else 'parse_error',
+                                               message=f'处理未完成：{type(exc).__name__}: {exc}',
+                                               article_url=result.article_url if result else '')
+                    finished.add(aid)
+                    self.progress(f'  保存失败：{type(exc).__name__}: {exc}')
+        finally:
+            # 仅修改本轮目标；不增加未轮到项目的尝试次数，也不改已完成结果。
+            with self.store.transaction():
+                for a in animes:
+                    if a['id'] not in finished:
+                        self.store.set_theme_fetch(a['id'], 'pending', reason_code='not_processed',
+                                                   message=pending_message)
+            self.progress('本轮状态已保存，未完成项目可通过“匹配待抓取番剧”继续')
         after = SeasonSnapshot.take(self.store, sid)
         rep.themes_added = len(after.theme_ids - before.theme_ids)
-        rep.themes_written = written
-        rep.subjects_with_themes = with_themes
-        self.progress(
-            f"完成：{with_themes}/{len(animes)} 部拿到曲目"
-            + (f"（维基 {wiki_used} 部）" if wiki_used else "")
-            + (f"（AnimeThemes 回退 {at_used} 部）" if at_used else "")
-            + f"，新增曲目 {rep.themes_added} 条"
-            + (f"（另有 {written - rep.themes_added} 条是更新已有行）"
-               if written > rep.themes_added else "")
-        )
-        if getattr(self, "_wiki_blocked", ""):
-            self.progress(
-                f"⚠ 维基曲目源本步被限流中止（{self._wiki_blocked}）："
-                f"有 {at_used} 部改用 AnimeThemes **回退源**。"
-                f"这**不是「维基没收录」** —— 换节点或过几分钟重跑即可补齐"
-            )
+        target_ids = {a['id'] for a in animes}
+        persisted = [r for r in self.store.theme_fetch_rows(sid) if r['anime_id'] in target_ids]
+        rep.subjects_with_themes = sum(r['status'] == 'success' and r['saved_count'] > 0 for r in persisted)
+        failed = sum(r['status'] == 'failed' for r in persisted)
+        pending = sum(r['status'] == 'pending' for r in persisted)
+        self.progress(f'完成：{rep.subjects_with_themes}/{len(animes)} 部维基曲目保存成功，'
+                      f'失败 {failed} 部，待抓取 {pending} 部，新增曲目 {rep.themes_added} 条'
+                      + (f'（另有 {rep.themes_written - rep.themes_added} 条是更新已有行）'
+                         if rep.themes_written > rep.themes_added else ''))
         for line in self._timing_lines(time.monotonic() - t0):
             self.progress(line)
         return rep

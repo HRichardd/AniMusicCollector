@@ -459,8 +459,8 @@ class TestOrchestratorFallback(unittest.TestCase):
         orch, logs = self._orch(WikipediaSource(client=FakeWikiClient(True), rps=0))
         themes, source = orch._collect_themes(["X"], _pooled_at())
 
-        self.assertTrue(source.startswith("animethemes:"), "应当改用回退源")
-        self.assertEqual([t["song_title"] for t in themes], ["回退曲"])
+        self.assertEqual(source, 'none', "限流不再回退其它来源")
+        self.assertEqual(themes, [])
         self.assertTrue(orch._wiki_blocked)
         joined = "\n".join(logs)
         self.assertIn("停止", joined)
@@ -534,14 +534,15 @@ class TestOrchestratorFallback(unittest.TestCase):
         rep = orch.fetch_season(Season.parse("2026Q4"))
         joined = "\n".join(logs)
 
-        self.assertEqual(rep.subjects_with_themes, 1)
-        self.assertIn("被限流中止", joined)
-        self.assertIn("回退源", joined)
+        self.assertEqual(rep.subjects_with_themes, 0)
+        self.assertIn("本轮停止", joined)
+        self.assertNotIn("回退源", joined)
         self.assertNotIn("维基与 AnimeThemes 都没有收录", joined,
                          "⚠️ 曲目其实拿到了（来自回退源），不许写成「都没收录」")
         rows = store.theme_list(store.get_season_id(2026, 4))
-        self.assertEqual([r["source"] for r in rows], ["animethemes"])
-        self.assertEqual(rows[0]["song_title"], "回退曲")
+        self.assertEqual(rows, [])
+        states = store.theme_fetch_rows(store.get_season_id(2026, 4))
+        self.assertEqual((states[0]['status'], states[0]['reason_code']), ('failed', 'rate_limited'))
 
 
 # ==================================================================== 汇总行

@@ -118,8 +118,8 @@ class SessionTestBase(unittest.TestCase):
 class TestBuildContract(SessionTestBase):
     def test_empty_build_has_all_sections(self):
         d = self.sess.build()
-        self.assertEqual(set(d), {"anime", "theme", "match", "push", "missing_source"})
-        for k in ("anime", "theme", "match", "push", "missing_source"):
+        self.assertEqual(set(d), {"anime", "theme", "match", "push", "missing_source", "theme_fetch"})
+        for k in ("anime", "theme", "match", "push", "missing_source", "theme_fetch"):
             self.assertIsInstance(d[k], list)
 
     def test_anime_row_keys(self):

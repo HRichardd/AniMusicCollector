@@ -171,7 +171,7 @@ class TestCrossThread(StoreThreadBase):
 
         sess = WizardSession(store=self.store, season=Season(2026, 4))
         data = self.in_thread(sess.build)
-        self.assertEqual(set(data), {"anime", "theme", "match", "push", "missing_source"})
+        self.assertEqual(set(data), {"anime", "theme", "match", "push", "missing_source", "theme_fetch"})
 
 
 class TestStoreLifecycle(StoreThreadBase):

@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QSplitter,
+    QTableView,
     QVBoxLayout,
     QWidget,
 )
@@ -383,10 +384,35 @@ class ThemePage(BasePage):
             Column("origin_label", "来源", 66, "readonly", align=Qt.AlignCenter),
             Column("note", "备注", 220, "text", editable=True),
         ]
-        super().__init__(1, "② OP/ED 曲目确认", "来自 AnimeThemes", cols, parent)
+        super().__init__(1, "② OP/ED 曲目确认", "日文维基百科 OP/ED · 点击匹配按钮后开始查询", cols, parent)
         self.next_btn.setText("确认曲目，下一步 →")
         self.missing = missing
         self.anime_choices: list[tuple[int, str]] = []
+        self.fetch_states: list[dict] = []
+        # 三个匹配入口需要额外宽度，将曲目筛选和状态统计单独放一行。
+        toolbar = self.toolbar_frame.layout()
+        filter_label = toolbar.itemAt(2).widget()
+        filter_label.setText('曲目筛选')
+        filters = QHBoxLayout()
+        for widget in (filter_label, self.filter_combo, self.badge):
+            toolbar.removeWidget(widget)
+            filters.addWidget(widget)
+        filters.addStretch()
+        self.body.addLayout(filters)
+        status_cols = [Column('anime', '番剧', 220, 'readonly'),
+                       Column('status_label', '抓取状态', 90, 'readonly'),
+                       Column('message', '原因 / 说明', 260, 'readonly'),
+                       Column('article_url', '维基词条', 280, 'readonly'),
+                       Column('attempts', '尝试次数', 80, 'readonly'),
+                       Column('attempted_label', '最近尝试', 155, 'readonly'),
+                       Column('wait_label', '可重试时间', 155, 'readonly')]
+        self.fetch_model = DictTableModel(status_cols, [])
+        self.fetch_table = QTableView()
+        self.fetch_table.setModel(self.fetch_model)
+        self.fetch_table.setMaximumHeight(190)
+        for i, col in enumerate(status_cols):
+            self.fetch_table.setColumnWidth(i, col.width)
+        self.add_widget(self.fetch_table)
 
         self.model = DictTableModel(cols, rows)
         self.table = self.make_table(self.model)
@@ -395,7 +421,7 @@ class ThemePage(BasePage):
 
         self.add_action("全选", lambda: self._set_all(True))
         self.add_action("+ 新增曲目", self._add, "primary", "数据源未收录时手动补充")
-        self.add_action("查看未收录的番", self._show_missing)
+        self.add_action("查看无曲目的番", self._show_missing)
 
         self.set_filter_spec({
             self.FILTER_ALL: None,
@@ -449,9 +475,24 @@ class ThemePage(BasePage):
         它是这里的一个动作 —— 原来筛选框里那个「数据源未收录」是假的。
         """
         if self.missing:
-            self.log.emit("AnimeThemes 未收录：" + "、".join(self.missing))
+            self.log.emit("尚无曲目的番（查询状态和原因见上方列表）：" + "、".join(self.missing))
         else:
-            self.log.emit("没有未收录的番")
+            self.log.emit("所有纳入番剧均已有曲目；维基查询结果以上方状态为准")
+
+    def set_fetch_states(self, states: list[dict]) -> None:
+        from datetime import datetime
+        labels = {'pending': '待抓取', 'running': '抓取中', 'success': '成功', 'failed': '失败'}
+        self.fetch_states = [dict(r) for r in states if r['included']]
+        rows = []
+        for state in self.fetch_states:
+            row = dict(state, status_label=labels[state['status']])
+            row['attempted_label'] = (datetime.fromtimestamp(state['attempted_at']).strftime('%Y-%m-%d %H:%M:%S')
+                                      if state['attempted_at'] is not None else '')
+            row['wait_label'] = (datetime.fromtimestamp(state['retry_not_before']).strftime('%Y-%m-%d %H:%M:%S')
+                                 if state['retry_not_before'] else '')
+            rows.append(row)
+        self.fetch_model.set_rows(rows)
+        self._refresh()
 
     def _refresh(self) -> None:
         # 统计条一律是**全量**口径（筛选只影响看到哪几行，不影响这些事实）。
@@ -470,10 +511,10 @@ class ThemePage(BasePage):
                (f"，其中 {len(by_anime)} 条的番在第①步被排除）" if by_anime else "）")
                if off else "")
         )
-        if self.missing:
-            self.badge.setText(f"⚠ {len(self.missing)} 部番数据源未收录")
-        else:
-            self.badge.setText("")
+        counts = {key: sum(r['status'] == key for r in self.fetch_states)
+                  for key in ('pending', 'running', 'success', 'failed')}
+        self.badge.setText(f"维基：成功 {counts['success']} · 失败 {counts['failed']} · "
+                           f"待抓取 {counts['pending']} · 抓取中 {counts['running']}")
 
 
 # ==================================================================== ③ 匹配

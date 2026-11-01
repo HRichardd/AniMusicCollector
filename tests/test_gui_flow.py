@@ -140,6 +140,58 @@ class TestGuiFlow(unittest.TestCase):
         self.assertIn("拉取", self.win.pages[0].actions_layout.itemAt(0).widget().text())
         self.assertIn("匹配", self.win.pages[2].actions_layout.itemAt(0).widget().text())
 
+    def test_three_theme_buttons_save_hidden_edits_and_dispatch_separately(self):
+        self._seed()
+        self.win.reload()
+        page = self.win.pages[1]
+        page.all_rows()[0]['song_title'] = '人工新曲名'
+        # 显示筛选不能影响整页保存，更不能用曲目行决定番剧处理范围。
+        page._apply_filter('仅 ED', log=False)
+        operations = []
+        def run(fn, label, **kwargs):
+            fn(progress=lambda text: None, should_stop=lambda: False)
+        with patch.object(self.win, '_run_task', side_effect=run), \
+                patch.object(self.sess, 'run_operation', side_effect=lambda op, *a, **k: operations.append(op)):
+            for i, title in enumerate(('匹配全部番剧曲名', '匹配待抓取番剧', '重新匹配失败番剧曲名')):
+                button = page.actions_layout.itemAt(i).widget()
+                self.assertEqual(button.text(), title)
+                button.click()
+        self.assertEqual(operations, ['refresh_themes', 'fetch_pending_themes', 'retry_failed_themes'])
+        self.assertEqual(self.store.theme_list(self.sess.season_id)[0]['song_title'], '人工新曲名')
+
+    def test_theme_fetch_save_failure_does_not_start_task(self):
+        with patch.object(self.sess, 'save_themes', side_effect=ValueError('保存冲突')), \
+                patch.object(self.win, '_run_task') as task, \
+                patch.object(QMessageBox, 'warning') as warning:
+            self.win._fetch_themes()
+        task.assert_not_called()
+        warning.assert_called_once()
+
+    def test_theme_status_includes_zero_song_anime_and_is_independent_of_filter(self):
+        aid, _, _ = self._seed()
+        other = self.store.upsert_anime(self.sess.season_id, Anime(
+            season_key='2026Q4', title_jp='零曲目番'))
+        self.store.set_theme_fetch(other, 'failed', reason_code='timeout', message='维基请求超时')
+        self.win.reload()
+        page = self.win.pages[1]
+        page._apply_filter('仅 ED', log=False)
+        rows = page.fetch_model.rows
+        self.assertEqual(len(rows), 2)
+        failure = next(r for r in rows if r['anime_id'] == other)
+        self.assertEqual((failure['status_label'], failure['message']), ('失败', '维基请求超时'))
+
+    def test_busy_theme_task_cannot_submit_another(self):
+        from unittest.mock import Mock
+        worker = Mock()
+        worker.isRunning.return_value = True
+        self.win.worker = worker
+        with patch.object(self.sess, 'save_themes') as save, patch.object(self.win, '_run_task') as task:
+            self.win._fetch_pending_themes()
+            self.win._retry_failed_themes()
+        save.assert_not_called()
+        task.assert_not_called()
+        self.win.worker = None
+
     # ---------------------------------------------------------------- 数据反映
 
     def test_reload_populates_pages(self):

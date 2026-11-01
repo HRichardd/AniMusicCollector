@@ -58,7 +58,7 @@ AnimeThemes 只提供**罗马音**曲名，而网易云索引的是**日文原�
 ## 解析的可靠性边界
 
 解析器处理**这两种**实测见过的格式。维基编辑风格不统一，
-遇到没见过的格式会**返回空**而不是猜 —— 调用方据此回落到 AnimeThemes。
+遇到没见过的格式会**返回空**而不是猜，由结构化结果记录失败原因。
 宁可少拿数据，不可拿错数据。
 """
 
@@ -68,10 +68,12 @@ import re
 import threading
 import time
 import unicodedata
+import urllib.error
+from urllib.parse import quote
 from dataclasses import dataclass, field
 
 from .. import constants
-from ..http import HttpClient, RateLimited
+from ..http import HttpClient, HttpError, RateLimited
 from ..models import ThemeKind
 
 WIKI_HOST = "ja.wikipedia.org"
@@ -488,11 +490,21 @@ def title_matches(anime_name: str, page_title: str) -> bool:
 
 # ---------------------------------------------------------------- 数据源
 
+@dataclass
+class ThemeFetchResult:
+    themes: list[WikiTheme] = field(default_factory=list)
+    article_url: str = ''
+    reason_code: str = ''
+    message: str = ''
+    retry_not_before: float = 0
+    stopped: bool = False
+
+
 class WikipediaSource:
     """日文维基的主题歌读取。
 
-    自带**进程内 + 磁盘缓存**：同一个词条在一次运行里只读一次 ——
-    既省请求（维基会限流），也避免重复解析。
+    匹配任务通过 begin_round / fetch_result 划分轮次：跨轮重新请求，
+    同轮共享正文。旧读取接口保留磁盘缓存兼容，不用于匹配任务。
     """
 
     def __init__(self, client: HttpClient | None = None, rps: float = WIKI_RPS,
@@ -547,6 +559,61 @@ class WikipediaSource:
                       "rate_limit_stopped": 0}
         #: 被限流熔断的原因（空 = 没被限流）。编排层据此停止查询并告诉用户。
         self.blocked_reason = ""
+        self._detailed = False
+        self._inspected_pages: dict[str, str] = {}
+        self._page_titles: dict[str, str] = {}
+
+    def begin_round(self, on_rate_limit=None) -> None:
+        """新任务不读取旧正文；本轮仍共享成功正文，HTTP等待与重试参数保留。"""
+        self._wt_cache.clear()
+        self._page_titles.clear()
+        self.blocked_reason = ''
+        getattr(self.http, '_rl_streak', {}).clear()
+        getattr(self.http, '_rl_tripped', set()).clear()
+        self.http._rl_budget_spent = False
+        self.http.stats = type(self.http.stats)()
+        self.http.on_rate_limit = on_rate_limit
+        for key in self.stats:
+            self.stats[key] = '' if key == 'last_error' else 0
+
+    def fetch_result(self, names: list[str]) -> ThemeFetchResult:
+        self._detailed = True
+        self._inspected_pages = {}
+        try:
+            themes, page = self.fetch_themes(names)
+            canonical = self._page_titles.get(page, page)
+            url = f'https://{WIKI_HOST}/wiki/{quote(canonical.replace(" ", "_"))}' if canonical else ''
+            if themes:
+                return ThemeFetchResult(themes=themes, article_url=url)
+            if self._inspected_pages:
+                page, text = next(iter(self._inspected_pages.items()))
+                has_section = any(theme_sections(t) for t in self._inspected_pages.values())
+                canonical = self._page_titles.get(page, page)
+                return ThemeFetchResult(
+                    article_url=f'https://{WIKI_HOST}/wiki/{quote(canonical.replace(" ", "_"))}',
+                    reason_code='no_usable_themes' if has_section else 'no_theme_section',
+                    message='未解析出可用 OP/ED' if has_section else '词条无主題歌栏目')
+            return ThemeFetchResult(reason_code='article_not_found', message='未找到匹配词条')
+        except RateLimited as exc:
+            deadline = time.time() + exc.retry_after if exc.retry_after is not None else 0
+            return ThemeFetchResult(reason_code='rate_limited', message='维基请求被限流（HTTP 429）',
+                                   retry_not_before=deadline, stopped=exc.breaker)
+        except (TimeoutError, urllib.error.URLError, OSError) as exc:
+            reason = getattr(exc, 'reason', exc)
+            timeout = isinstance(reason, TimeoutError) or 'timed out' in str(reason).lower()
+            return ThemeFetchResult(reason_code='timeout' if timeout else 'network_error',
+                                   message='维基请求超时' if timeout else '维基网络请求失败')
+        except Exception as exc:
+            # 取消必须传播到任务层，不能被包装成一次维基失败。
+            if getattr(self.http, 'check_cancelled', None) is not None:
+                self.http.check_cancelled()
+            cause = exc.__cause__
+            timeout = isinstance(cause, TimeoutError) or isinstance(getattr(cause, 'reason', None), TimeoutError)
+            timeout = timeout or 'timed out' in str(exc).lower()
+            code = 'timeout' if timeout else ('network_error' if isinstance(exc, HttpError) else 'parse_error')
+            return ThemeFetchResult(reason_code=code, message=f'维基查询失败：{type(exc).__name__}')
+        finally:
+            self._detailed = False
 
     # ---- 底层
     def _api(self, params: dict) -> dict | None:
@@ -567,7 +634,10 @@ class WikipediaSource:
             f"{k}={_quote(v)}" for k, v in params.items()
         )
         try:
-            return self.http.get_json(url, use_cache=True)
+            data = self.http.get_json(url, use_cache=not self._detailed)
+            if self._detailed and (not isinstance(data, dict) or data.get('error')):
+                raise ValueError('维基 API 响应异常')
+            return data
         except RateLimited as e:
             with self._lock:
                 self.stats["api_failed"] += 1
@@ -577,15 +647,19 @@ class WikipediaSource:
                     self.blocked_reason = (
                         f"HTTP 429，服务端要求等待 {e.retry_after:.0f} 秒"
                         if e.retry_after is not None else "HTTP 429（限流）")
-            if e.breaker:
+            if e.breaker or self._detailed:
                 raise
             return None
         except Exception as e:  # noqa: BLE001 - 单个词条失败不该中断整季
+            if getattr(self.http, 'check_cancelled', None) is not None:
+                self.http.check_cancelled()
             with self._lock:
                 self.stats["api_failed"] += 1
                 st = getattr(e, "status", None)
                 self.stats["last_error"] = (f"HTTP {st}" if st
                                             else f"{type(e).__name__}: {e}")
+            if self._detailed:
+                raise
             return None
 
     def wikitext(self, page: str) -> str | None:
@@ -640,7 +714,7 @@ class WikipediaSource:
             self.stats["titles_asked"] += len(chunk)
         try:
             d = self._api(params)
-        except RateLimited:
+        except Exception:
             # 熔断必须往外抛（见 `_api` 的说明），但这批候选名确实**没问到**
             # —— 不记的话「候选名 = 查无 + 取到 + 没问到」立刻对不上账。
             with self._lock:
@@ -652,6 +726,11 @@ class WikipediaSource:
             return {}
 
         q = d.get("query") or {}
+        if self._detailed and (not isinstance(q, dict) or not isinstance(q.get('pages'), list)
+                               or any(not isinstance(p, dict) for p in q['pages'])):
+            with self._lock:
+                self.stats['titles_unanswered'] += len(chunk)
+            raise ValueError('维基响应缺少有效词条列表')
         pages = {p.get("title"): p for p in (q.get("pages") or []) if p.get("title")}
         # 请求名 →（归一化）→（重定向）→ 真正的词条名。
         # 归一化那一步不能省：`A_(アニメ)` 和 `A (アニメ)` 在服务端是同一个
@@ -660,7 +739,7 @@ class WikipediaSource:
         norm = {m.get("from"): m.get("to") for m in (q.get("normalized") or [])}
         redir = {m.get("from"): m.get("to") for m in (q.get("redirects") or [])}
         out: dict[str, str | None] = {}
-        for t in chunk:
+        for index, t in enumerate(chunk):
             final = t
             for _ in range(5):          # 最多跟 5 跳；有环也能出去
                 nxt = norm.get(final) or redir.get(final)
@@ -673,6 +752,10 @@ class WikipediaSource:
                 # 两个桶都不进（宁可少报，也不把一件事塞进错的桶里）
                 with self._lock:
                     self.stats["titles_unanswered"] += 1
+                if self._detailed:
+                    with self._lock:
+                        self.stats['titles_unanswered'] += len(chunk) - index - 1
+                    raise ValueError('维基响应缺少候选词条')
                 continue
             if p.get("missing"):
                 with self._lock:
@@ -689,11 +772,15 @@ class WikipediaSource:
                 # 记成「没问到」且**不写缓存**，账也照样平。
                 with self._lock:
                     self.stats["titles_unanswered"] += 1
+                if self._detailed:
+                    with self._lock:
+                        self.stats['titles_unanswered'] += len(chunk) - index - 1
+                    raise ValueError('维基响应缺少正文')
                 continue
+            self._page_titles[t] = final
             self._wt_cache[t] = content
-            if content:
-                with self._lock:
-                    self.stats["page_hits"] += 1
+            with self._lock:
+                self.stats["page_hits"] += 1
             out[t] = content
         return out
 
@@ -717,6 +804,8 @@ class WikipediaSource:
                        "srlimit": limit, "format": "json", "formatversion": 2})
         if d is None:
             return []
+        if self._detailed and not isinstance((d.get('query') or {}).get('search'), list):
+            raise ValueError('维基搜索响应缺少结果列表')
         return [h["title"] for h in (d.get("query") or {}).get("search", [])]
 
     # ---- 找词条
@@ -741,6 +830,8 @@ class WikipediaSource:
             got = self.wikitext_many(chunk)
             for c in chunk:
                 wt = got.get(c)
+                if wt is not None and self._detailed:
+                    self._inspected_pages[c] = wt
                 if wt and parse_from_wikitext(wt, page=c):
                     return c, "exact"
 
@@ -759,6 +850,8 @@ class WikipediaSource:
             got = self.wikitext_many(keep)      # 命中的几个也批量问，别一个一个来
             for hit in keep:
                 wt = got.get(hit)
+                if wt is not None and self._detailed:
+                    self._inspected_pages[hit] = wt
                 if wt and parse_from_wikitext(wt, page=hit):
                     return hit, "search"
         return None, "none"
@@ -768,7 +861,7 @@ class WikipediaSource:
                      ) -> tuple[list[WikiTheme], str]:
         """按番剧名抓主题歌。返回 (主题歌列表, 词条名或空)。
 
-        拿不到就返回空列表 —— 调用方应当回落到 AnimeThemes。
+        拿不到就返回空列表；需要失败分类时使用 fetch_result，不回退其它来源。
         """
         page, how = self.find_article(names)
         if not page:

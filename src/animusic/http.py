@@ -349,6 +349,8 @@ class HttpClient:
         self.stats = RequestStats()
         self._on_event = on_event
         self.check_cancelled = None
+        # 立即持久化等待期限：即使用户在自动等待中取消，重启也不能绕过它。
+        self.on_rate_limit = None
 
         # ---- HTTP 429（限流）的策略，见 `constants` 里那一节
         #: **本步为限流等待的总预算（秒）**。为什么必须有它而不是「单次上限」：
@@ -541,6 +543,8 @@ class HttpClient:
                     self.stats.rate_limited += 1
                     wait = parse_retry_after(
                         header_value(getattr(e, "headers", None), "Retry-After"))
+                    if self.on_rate_limit is not None and wait is not None:
+                        self.on_rate_limit(time.time() + wait)
                     self._note_attempt(url, dt, "HTTP 429（限流，不是网络故障）",
                                        i, attempts)
                     # ⚠️ 重试**不计入**「连续限流」的计数。这是第一版写错的地方：
@@ -611,7 +615,7 @@ class HttpClient:
             + f"{url} —— {last}",
             status=getattr(last, "status", None),
             url=url,
-        )
+        ) from last
 
     # ---- 便捷方法
     def get(self, url: str, **kw) -> Response:

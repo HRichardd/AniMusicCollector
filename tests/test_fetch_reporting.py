@@ -25,6 +25,7 @@ from __future__ import annotations
 import os
 import sys
 import unittest
+from unittest.mock import patch
 from dataclasses import dataclass
 from datetime import date
 
@@ -171,20 +172,21 @@ class TestCompletionLine(FetchReportingBase):
         joined = "\n".join(logs)
 
         self.assertEqual(rep.subjects_with_themes, 2)
-        self.assertEqual(len(rep.matched), 1, "前提：只有 1 部能在 AnimeThemes 池里对上")
-        self.assertIn("2/2 部拿到曲目", joined)
+        self.assertEqual(len(rep.matched), 0, "仅维基曲名抓取不再运行 AnimeThemes 名称匹配")
+        self.assertIn("2/2 部维基曲目保存成功", joined)
         self.assertNotIn("完成：匹配", joined,
                          "主结果行又变回打 AnimeThemes 的匹配数了")
-        self.assertIn("维基 2 部", joined)
+        self.assertTrue(all(r['status'] == 'success' for r in self.store.theme_fetch_rows(
+            self.store.get_season_id(2026, 4))))
 
-    def test_animethemes_match_is_labelled_as_a_fallback(self):
-        """AnimeThemes 的匹配数可以显示，但必须说清它只是回退源。"""
+    def test_animethemes_is_never_queried_or_reported_as_fallback(self):
+        """CLI 与 GUI 同样不允许借其它来源补曲。"""
         orch, logs = self.scenario()
-        orch.fetch_season(self.season)
+        with patch.object(orch.animethemes, 'fetch_season', side_effect=AssertionError('不能加载匹配池')) as fetch:
+            orch.fetch_season(self.season)
+        fetch.assert_not_called()
         joined = "\n".join(logs)
-        self.assertIn("AnimeThemes", joined)
-        self.assertIn("回退源", joined)
-        self.assertIn("没匹配上不代表这部番没有曲目", joined)
+        self.assertNotIn("回退源", joined)
 
 
 # ==================================================================== 曲目计数
@@ -234,14 +236,12 @@ class TestThemesAdded(FetchReportingBase):
 # ==================================================================== 匹配池
 
 class TestPoolIsNotTheAnimeList(FetchReportingBase):
-    def test_pool_line_says_it_is_only_for_matching(self):
-        """池子那行必须写明「不会加入番单」—— 否则用户以为整季都被收进来了。"""
+    def test_no_pool_is_loaded(self):
+        """曲名仅维基，不再加载当季匹配池。"""
         orch, logs = self.scenario()
-        rep = orch.fetch_season(self.season)
-        joined = "\n".join(logs)
-        self.assertIn("不会加入番单", joined)
-        self.assertIn("匹配池", joined)
-        self.assertIn("当季 3 部", joined)
+        with patch.object(orch, '_at_pool', side_effect=AssertionError('不能加载匹配池')) as pool:
+            orch.fetch_season(self.season)
+        pool.assert_not_called()
 
     def test_pool_size_never_becomes_anime_rows(self):
         """库里只该有在看列表那 2 部，池子里的另外 2 部一部都不能进。"""
@@ -253,13 +253,12 @@ class TestPoolIsNotTheAnimeList(FetchReportingBase):
         self.assertEqual({r["title_cn"] for r in rows}, {"番A", "番B"})
         self.assertEqual(rep.subjects_in_season, 2)
 
-    def test_pool_match_shows_how_many_were_used(self):
-        """池子那几行要能看出「49 部里用到了几部」。"""
+    def test_wiki_scope_is_included_anime(self):
         orch, logs = self.scenario()
         orch.fetch_season(self.season)
         joined = "\n".join(logs)
-        self.assertIn("名称匹配上 1/2 部", joined)
-        self.assertIn("与你在看的番无关", joined)
+        self.assertIn("本轮 2 部", joined)
+        self.assertIn("只处理纳入番剧", joined)
 
 
 # ==================================================================== 另一条入口
@@ -295,21 +294,16 @@ class TestAnimethemesOnlyPath(FetchReportingBase):
 
     def test_first_run_counts_new_rows(self):
         orch, logs = self.build()
-        rep = orch.fetch_season_from_animethemes(self.season, bridge_names=False)
-        self.assertEqual(rep.themes_added, 3)
-        self.assertEqual(rep.subjects_with_themes, 2)
-        joined = "\n".join(logs)
-        self.assertIn("新增曲目 3 条", joined)
-        self.assertIn("2 部拿到曲目", joined)
+        with self.assertRaises(NotImplementedError):
+            orch.fetch_season_from_animethemes(self.season, bridge_names=False)
+        self.assertEqual(self.store.anime_list(self.store.get_season_id(2026, 4)), [])
 
     def test_second_run_does_not_claim_new_rows(self):
-        self.build()[0].fetch_season_from_animethemes(self.season, bridge_names=False)
         orch, logs = self.build()
-        rep = orch.fetch_season_from_animethemes(self.season, bridge_names=False)
-        self.assertEqual(rep.themes_added, 0, "重跑不该报出新增行")
-        joined = "\n".join(logs)
-        self.assertIn("新增曲目 0 条", joined)
-        self.assertIn("另有 3 条是更新已有行", joined)
+        for _ in range(2):
+            with self.assertRaises(NotImplementedError):
+                orch.fetch_season_from_animethemes(self.season, bridge_names=False)
+        self.assertNotIn('新增曲目', '\n'.join(logs))
 
 
 if __name__ == "__main__":

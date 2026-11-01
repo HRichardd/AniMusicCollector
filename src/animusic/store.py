@@ -91,6 +91,36 @@ CREATE TABLE IF NOT EXISTS anime (
 CREATE INDEX IF NOT EXISTS idx_anime_season ON anime(season_id);
 CREATE INDEX IF NOT EXISTS idx_anime_bgm ON anime(season_id, bgm_id);
 
+CREATE TABLE IF NOT EXISTS theme_fetch (
+    anime_id INTEGER PRIMARY KEY REFERENCES anime(id) ON DELETE CASCADE,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','running','success','failed')),
+    reason_code TEXT NOT NULL DEFAULT '',
+    message TEXT NOT NULL DEFAULT '',
+    article_url TEXT NOT NULL DEFAULT '',
+    attempted_at REAL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    retry_not_before REAL NOT NULL DEFAULT 0,
+    saved_count INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS source_wait (
+    source TEXT PRIMARY KEY,
+    retry_not_before REAL NOT NULL DEFAULT 0
+);
+INSERT OR IGNORE INTO theme_fetch(anime_id) SELECT id FROM anime;
+CREATE TRIGGER IF NOT EXISTS anime_theme_fetch_insert AFTER INSERT ON anime
+BEGIN
+    INSERT OR IGNORE INTO theme_fetch(anime_id) VALUES(NEW.id);
+END;
+CREATE TRIGGER IF NOT EXISTS anime_theme_fetch_rename
+AFTER UPDATE OF title_cn,title_jp,title_romaji ON anime
+WHEN COALESCE(OLD.title_cn,'')!=COALESCE(NEW.title_cn,'')
+  OR COALESCE(OLD.title_jp,'')!=COALESCE(NEW.title_jp,'')
+  OR COALESCE(OLD.title_romaji,'')!=COALESCE(NEW.title_romaji,'')
+BEGIN
+    UPDATE theme_fetch SET status='pending',reason_code='query_changed',
+        message='番名已变化，待重新查询',article_url='',saved_count=0 WHERE anime_id=NEW.id;
+END;
+
 CREATE TABLE IF NOT EXISTS theme (
     id         INTEGER PRIMARY KEY,
     anime_id   INTEGER NOT NULL REFERENCES anime(id) ON DELETE CASCADE,
@@ -227,6 +257,42 @@ class Store:
         self.conn.executescript(SCHEMA)     # 建表（顺带在当前线程建出第一条连接）
         self._migrate_theme_identity()
         self._migrate_push_selection()
+        # 只在打开 Store 时恢复，不在页面刷新时修改正在运行的任务。
+        self.conn.execute("UPDATE theme_fetch SET status='pending', reason_code='interrupted', "
+                          "message='上次任务异常中断，待重新查询' WHERE status='running'")
+        self._commit()
+
+    def theme_fetch_rows(self, season_id: int) -> list[dict]:
+        rows = [dict(r) for r in self.conn.execute(
+            "SELECT f.*, COALESCE(NULLIF(a.title_cn,''),NULLIF(a.title_jp,''),a.title_romaji,'?') AS anime, "
+            "a.included FROM theme_fetch f JOIN anime a ON a.id=f.anime_id "
+            "WHERE a.season_id=? ORDER BY a.id", (season_id,))]
+        deadline = self.source_wait_until()
+        for row in rows:
+            row['retry_not_before'] = max(row['retry_not_before'], deadline)
+        return rows
+
+    def set_theme_fetch(self, anime_id: int, status: str, *, reason_code: str = '',
+                        message: str = '', article_url: str = '',
+                        retry_not_before: float = 0, saved_count: int = 0,
+                        start: bool = False) -> None:
+        import time
+        self.conn.execute(
+            "UPDATE theme_fetch SET status=?,reason_code=?,message=?,article_url=?,"
+            "retry_not_before=?,saved_count=?,attempts=attempts+?,"
+            "attempted_at=CASE WHEN ? THEN ? ELSE attempted_at END WHERE anime_id=?",
+            (status, reason_code, message, article_url, retry_not_before, saved_count,
+             int(start), int(start), time.time(), anime_id))
+        self._commit()
+
+    def source_wait_until(self, source: str = 'wikipedia') -> float:
+        row = self.conn.execute("SELECT retry_not_before FROM source_wait WHERE source=?", (source,)).fetchone()
+        return float(row[0]) if row else 0.0
+
+    def save_source_wait(self, deadline: float, source: str = 'wikipedia') -> None:
+        self.conn.execute("INSERT INTO source_wait(source,retry_not_before) VALUES(?,?) "
+                          "ON CONFLICT(source) DO UPDATE SET retry_not_before=MAX(retry_not_before,excluded.retry_not_before)",
+                          (source, deadline))
         self._commit()
 
     def _migrate_push_selection(self) -> None:

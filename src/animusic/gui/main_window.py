@@ -1130,10 +1130,12 @@ class MainWindow(QMainWindow):
                                     "番单来源尚未确定，暂不可用", index=1)
         all_anime.setEnabled(False)
 
-        theme.add_action("拉取 / 更新 OP/ED", self._fetch_themes, "primary",
-                         "只更新**番单里已纳入**的那些番的曲目；\n"
-                         "不会把当季全部番拉进来（那是第①步「仅从 AnimeThemes 拉当季」的事）",
-                         index=0)
+        theme.add_action("匹配全部番剧曲名", self._fetch_themes, "primary",
+                         "重新查询全部纳入番剧的维基 OP/ED，包括此前成功项目", index=0)
+        theme.add_action("匹配待抓取番剧", self._fetch_pending_themes, "normal",
+                         "只查询待抓取番剧，继续补齐取消或限流后未处理的项目", index=1)
+        theme.add_action("重新匹配失败番剧曲名", self._retry_failed_themes, "normal",
+                         "只重新查询失败番剧，跳过成功和待抓取项目", index=2)
 
         match.add_action("开始匹配网易云", self._run_match, "primary",
                          "对每条曲目搜索并打分（后台执行）", index=0)
@@ -1221,6 +1223,7 @@ class MainWindow(QMainWindow):
         self.pages[0].set_data(self.data["anime"])
         self.pages[1].set_data(self.data["theme"])
         self.pages[1].missing = self.data["missing_source"]
+        self.pages[1].set_fetch_states(self.data.get('theme_fetch', []))
         self.pages[1].anime_choices = [(r["anime_id"], " · ".join(x for x in (
             r["title_cn"], r["title_jp"] if r["title_jp"] != r["title_cn"] else "", r["air_date"]) if x))
             for r in self.data["anime"] if r["included"]]
@@ -1273,6 +1276,8 @@ class MainWindow(QMainWindow):
     @Slot(str)
     def _task_progress(self, message: str) -> None:
         self.log(f"    {message}")
+        if getattr(self.worker, '_theme_fetch', False) and not self._closing:
+            self.pages[1].set_fetch_states(self.session.store.theme_fetch_rows(self.session.season_id))
 
     @Slot(str, str)
     def _worker_failed(self, message: str, traceback_text: str) -> None:
@@ -1282,6 +1287,7 @@ class MainWindow(QMainWindow):
     def _worker_succeeded(self, result) -> None:
         worker = self.sender()
         self._task_done(worker.label, result, worker._ui_done, refresh_on_success=worker._ui_refresh)
+        worker._ui_refreshed = True
 
     def _task_failed(self, label: str, msg: str, tb: str) -> None:
         self.log(f"✗ {label} 失败：{msg}")
@@ -1312,6 +1318,9 @@ class MainWindow(QMainWindow):
             worker = self.sender()
         if worker is self.worker:
             self._busy(False)
+            if (getattr(worker, '_theme_fetch', False) and not self._closing
+                    and not getattr(worker, '_ui_refreshed', False)):
+                self.reload('曲名匹配已停止，显示已保存结果')
         self._finish_close_when_ready()
 
     # ---- 具体动作
@@ -1353,23 +1362,30 @@ class MainWindow(QMainWindow):
         self._run_task(job, f"{season.key} 增量重跑", on_done=done)
 
     def _fetch_themes(self) -> None:
-        """第②步的「拉取 / 更新 OP/ED」= **只更新当前番单的曲目**。
+        self._start_theme_fetch('refresh_themes', '匹配全部番剧曲名')
 
-        ⚠️ 这里原来接的是 `fetch_season_from_animethemes`，也就是第①步那个
-        "仅从 AnimeThemes 拉当季" —— 按设计它会把**整季**番写进番单，
-        于是用户点"更新曲目"却看到番单里凭空多出几十部没在看的番（实测报的 bug②）。
-        两件事现在彻底分开：
-          · 第①步「仅从 AnimeThemes 拉当季」→ 有意地把整季收进来
-          · 第②步「拉取 / 更新 OP/ED」→ 只碰番单里已纳入的那几部
-        """
-        sess = self.session
-        season = sess.season
+    def _fetch_pending_themes(self) -> None:
+        self._start_theme_fetch('fetch_pending_themes', '匹配待抓取番剧')
 
+    def _retry_failed_themes(self) -> None:
+        self._start_theme_fetch('retry_failed_themes', '重新匹配失败番剧曲名')
+
+    def _start_theme_fetch(self, operation: str, label: str) -> None:
+        if self._closing or (self.worker is not None and self.worker.isRunning()):
+            return
+        # 重载前先保存整张曲目表，筛选隐藏的人工编辑和取舍同样受保护。
+        try:
+            self.session.save_themes(self.pages[1].all_rows(), confirm=False)
+        except Exception as exc:
+            self.log(f'曲目保存失败，未开始匹配：{exc}')
+            QMessageBox.warning(self, '保存失败', str(exc))
+            return
+        sess, season = self.session, self.session.season
         def job(progress=None, should_stop=None):
-            return sess.run_operation('refresh_themes', season, progress=progress, should_stop=should_stop)
-
-        self._run_task(job, f"更新曲目 {season.key}")
-
+            return sess.run_operation(operation, season, progress=progress, should_stop=should_stop)
+        self._run_task(job, label)
+        if self.worker is not None:
+            self.worker._theme_fetch = True
     def _exclude_supplemental(self) -> None:
         """第①步：把「仅从 AnimeThemes 拉当季」带进来的番一键取消纳入。
 

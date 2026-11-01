@@ -705,8 +705,7 @@ def cmd_fetch(args) -> int:
     # 现在改成**真的去库里数**：本季有多少部番至少有一条曲目。
     # 数据来源是 store（`theme_list` 的 anime_id 去重），不是拿别的数字凑出来的。
     try:
-        _s = Season.parse(args.season)
-        _sid = orch.store.get_season_id(_s.year, _s.quarter)
+        _sid = orch.store.get_season_id(season.year, season.quarter)
         _anime = orch.store.anime_list(_sid)
         _themes = orch.store.theme_list(_sid)
         _have = {t["anime_id"] for t in _themes}
@@ -716,20 +715,14 @@ def cmd_fetch(args) -> int:
             "green" if _anime and _covered >= len(_anime) else "yellow")
     except Exception as e:  # noqa: BLE001 - 数不出来就不显示，绝不编一个数
         out(f"  有曲目的番           （数不出来：{type(e).__name__}: {e}）", "yellow")
-    out(f"  AnimeThemes 命中     {len(rep.matched)}/{rep.subjects_in_season}"
-        f"（仅回退路径用，维基命中时不需要）")
-    failed = rep.search_failed_unmatched
-    if failed:
-        out("")
-        out(f"  ⚠️ 其中 {len(failed)} 部是**搜索失败**没能确认 —— 重跑一次即可：", "yellow")
-        for m in failed[:5]:
-            out(f"    · {m.title_cn}  {m.search_error[:70]}")
-    if rep.unmatched:
-        out("")
-        out(f"  {len(rep.unmatched)} 部 AnimeThemes 没匹配上"
-            f"（**不代表没曲目** —— 维基已覆盖的会照常写入）：")
-        for m in rep.unmatched:
-            out(f"    · {m.title_cn}  AnimeThemes 相似度 {m.score:.2f}")
+    states = [r for r in orch.store.theme_fetch_rows(
+        orch.store.get_season_id(season.year, season.quarter)) if r['included']]
+    out('  维基抓取状态         ' + ' · '.join(
+        f'{label} {sum(r["status"] == status for r in states)}'
+        for status, label in (("success", "成功"), ("failed", "失败"), ("pending", "待抓取"))))
+    for row in states:
+        if row['status'] == 'failed':
+            out(f'    · {row["anime"]}：{row["message"]} [{row["reason_code"]}]', 'yellow')
     return 0
 
 
@@ -825,7 +818,7 @@ def build_parser() -> argparse.ArgumentParser:
     f.add_argument("--season", default=_season_default,
                         help="季度，形如 2026Q4（默认=今天所在的季度）")
     f.add_argument("--retry-missing", action="store_true",
-                   help="重试 missing_*（不碰 missing_match）")
+                   help="仅重试番剧维基曲名抓取失败项，不处理待抓取或成功项目")
     f.set_defaults(func=cmd_fetch)
 
     m = sub.add_parser("match", help="搜索网易云 + 打分")

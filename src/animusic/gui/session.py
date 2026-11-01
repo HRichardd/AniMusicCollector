@@ -160,6 +160,7 @@ class WizardSession:
             "match": match_rows,
             "push": push_rows,
             "missing_source": missing_source,
+            "theme_fetch": self.store.theme_fetch_rows(sid),
         }
 
     def stats(self, data: dict[str, list[dict]] | None = None) -> dict[str, int]:
@@ -265,7 +266,8 @@ class WizardSession:
                 "song_title": r["song_title"] or "",
                 "artists": artists_from_json(r["artists"]),
                 "origin": str(origin),
-                "origin_label": _ORIGIN_LABEL.get(origin, str(origin)),
+                "origin_label": ('维基' if r['source'] == 'wikipedia' and origin != Origin.MANUAL
+                                 else _ORIGIN_LABEL.get(origin, str(origin))),
                 #: 这一行的番在①里有没有被纳入 —— 界面上「已排除」的计数要用它区分
                 #: 「这条曲目被排除了」和「它的番被排除了」（两者都表现为勾没打上）
                 "anime_included": anime_on,
@@ -452,7 +454,7 @@ class WizardSession:
         for r, aid in assigned:
             r["anime_id"] = aid
 
-    def save_themes(self, rows: list[dict]) -> None:
+    def save_themes(self, rows: list[dict], *, confirm: bool = True) -> None:
         """整页原子保存；缺席行不等于删除，排除必须由 included 明确表达。"""
         sid = self.season_id
         anime_ids = {r["id"]: (r["title_cn"] or r["title_jp"] or r["title_romaji"])
@@ -518,7 +520,10 @@ class WizardSession:
                     tid = int(cur.lastrowid)
                     changed_page = True
                 assigned.append((r, tid, aid))
-            self.store.set_stage(sid, Stage.THEME, StageStatus.CONFIRMED, confirmed=True)
+            if confirm:
+                self.store.set_stage(sid, Stage.THEME, StageStatus.CONFIRMED, confirmed=True)
+            elif changed_page:
+                self.store.set_stage(sid, Stage.THEME, StageStatus.FETCHED, fetched=True)
             if changed_page:
                 self.store.mark_downstream_dirty(sid, Stage.THEME)
         for r, tid, aid in assigned:
