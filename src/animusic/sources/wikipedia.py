@@ -1,4 +1,4 @@
-"""日文维基百科「主題歌」栏 —— OP/ED 曲目的**主数据源**。
+"""维基百科动画歌曲 —— OP、ED和插入曲的主数据源，日文优先、中文补充。
 
 ## 为什么换源（用户提议，直击要害）
 
@@ -129,11 +129,15 @@ class WikiTheme:
     page: str = ""
     source_language: str = 'ja'
     section: str = ''
+    season_keys: tuple[str, ...] = ()
+    scope_review: str = ''
+    episode_ranges: tuple[tuple[int, int | None], ...] = ()
+    season_conflict: bool = False
 
     @property
     def is_interlude(self) -> bool:
-        """插入歌 / 角色歌 —— 不属于 OP/ED，默认不纳入。"""
-        return "挿入歌" in self.note or "劇中歌" in self.note
+        """兼容旧调用方的插入曲判定；角色歌不能仅凭名称归类。"""
+        return self.kind == ThemeKind.IN or "挿入歌" in self.note or "劇中歌" in self.note
 
 
 # ---------------------------------------------------------------- 清理
@@ -149,6 +153,14 @@ _TAG = re.compile(r"<[^>]+>")
 def clean_wikitext(s: str) -> str:
     s = _COMMENT.sub("", s)
     s = _REF.sub("", s)
+    # 这些模板的参数是显示文本；从内到外展开后再清理未知模板。
+    for _ in range(6):
+        s = re.sub(r'\{\{\s*(?:tsl|link-ja|link-jp)\s*\|(?:ja\s*\|)?([^{}]+)\}\}',
+                   lambda m: m[1].split('|')[-1].strip(), s, flags=re.I)
+        s = re.sub(r'\{\{\s*(?:lj|lang-ja)\s*\|([^{}]+)\}\}', r'\1', s, flags=re.I)
+        s = re.sub(r'\{\{\s*(?:lang|langx)\s*\|[a-z-]+\s*\|([^{}]+)\}\}', r'\1', s, flags=re.I)
+        s = re.sub(r'\{\{\s*(?:单双书(?:名)?号转换|單雙書(?:名)?號轉換)\s*\|([^{}|]+)\}\}', r'\1', s)
+        s = re.sub(r'\{\{\s*ruby\s*\|([^{}|]+)\|[^{}]+\}\}', r'\1', s, flags=re.I)
     # 语言标注模板的参数本身就是显示文本；直接删除会把中文页里的日文曲名一起删掉。
     s = re.sub(r'\{\{\s*(?:lj|lang-ja)\s*\|([^{}]+)\}\}', r'\1', s, flags=re.I)
     s = re.sub(r'\{\{\s*lang\s*\|[a-z-]+\s*\|([^{}]+)\}\}', r'\1', s, flags=re.I)
@@ -185,6 +197,7 @@ _SECTION_RX = re.compile(
     re.M,
 )
 _KIND_PATTERNS = (
+    (re.compile(r"挿入歌|劇中歌|插入曲|插曲|剧中歌"), ThemeKind.IN),
     (re.compile(r"オープニング|OPテーマ"), ThemeKind.OP),
     (re.compile(r"エンディング|EDテーマ"), ThemeKind.ED),
 )
@@ -220,6 +233,7 @@ _SEASON_SUFFIX = re.compile(
     r"|[0-9]+(st|nd|rd|th)\s+Season"
     r"|Season\s*[0-9]+"
     r"|[0-9]+(?:st|nd|rd|th)(?:\s*(?:&|＆|and)\s*[0-9]+(?:st|nd|rd|th))?\s+STAGE"
+    r"|第[0-9一二三四五六七八九十]+(?:[&＆、及和]\s*第?[0-9一二三四五六七八九十]+)?赛段"
     r"|シーズン[0-9]+"
     r"|[ⅡⅢⅣⅤ]+"
     r")[\s　]*$",
@@ -344,18 +358,11 @@ def theme_section(wikitext: str) -> str | None:
 
 
 def parse_from_wikitext(wikitext: str, page: str = "",
-                        include_interludes: bool = False) -> list[WikiTheme]:
-    """从整篇 wikitext 抽主题歌 —— 依次试每个候选段落，取第一个有结果的。
-
-    这是**推荐的入口**：单个段落名不可靠，靠「解析出东西」来判定才对。
-    """
-    for seg in theme_sections(wikitext):
-        themes = parse_themes(seg, page=page)
-        if not include_interludes:
-            themes = [t for t in themes if not t.is_interlude]
-        if themes:
-            return themes
-    return []
+                        include_interludes: bool = True) -> list[WikiTheme]:
+    """旧入口也遵循动画范围全季收录，避免CLI和GUI使用不同类别规则。"""
+    from .wiki_songs import parse_scoped
+    themes, _ = parse_scoped(wikitext, page, [], 'ja')
+    return [t for t in themes if t.kind is not None and (include_interludes or not t.is_interlude)]
 
 
 def _artist_from_desc(desc: str) -> str:
@@ -367,96 +374,14 @@ def _artist_from_desc(desc: str) -> str:
 
 
 def parse_themes(segment: str, page: str = "") -> list[WikiTheme]:
-    """解析主题歌段 —— 支持实测见到的两种格式。
-
-    **遇到不认识的格式就返回空**，不猜。调用方据此回落到 AnimeThemes。
-    """
-    out: list[WikiTheme] = []
-
-    # ---- 格式 A：定义列表
-    for m in re.finditer(r"^;\s*(.+?)\s*$\n:\s*(.+?)\s*$", segment, re.M):
-        head, desc = clean_wikitext(m.group(1)), clean_wikitext(m.group(2))
-        q = _QUOTE.search(head)
-        title = (q.group(1) if q else head).strip()
-        kind = _kind_of(desc) or _kind_of(head)
-        if not title or kind is None:
-            continue
-        artist = _artist_from_desc(desc)
-        out.append(WikiTheme(
-            kind=kind, song_title=title,
-            artists=[artist] if artist else [],
-            sequence=_seq_of(desc) or _seq_of(head),
-            note=desc[:160], raw=desc[:200], fmt="list", page=page,
-        ))
-
-    # ---- 格式 B：wikitable
-    #
-    # ⚠️ 真实结构里，「使用話」在 `!` 行、**「曲名/歌手」在下一行 `|` 行**：
-    #
-    #     ! 1 - 12
-    #     | [[花になって]] || [[緑黄色社会]] || 長屋晴子
-    #
-    # 一开始我假设它们在同一个单元格组里（`! num | title || artist`），
-    # 于是表格格式**一直解析出 0 条**——列表格式的表掩盖了这个 bug。
-    # 现在把 `!` 行的话数记下来，供紧随其后的 `|` 行使用。
-    if "{|" in segment:
-        cur_kind: ThemeKind | None = None
-        pending_num = ""
-        for line in segment.split("\n"):
-            s = line.strip()
-            if s.startswith("|+"):
-                # ⚠️ 必须**直接赋值**（不能 `or cur_kind` 保留旧值）。
-                # 实测：主題歌段里 エンディングテーマ 表之后还有一张
-                # 「挿入歌」表，保留旧 kind 会把 7 首**插入歌**当成 ED ——
-                # 那会污染歌单（插入歌不是 OP/ED）。
-                # 新标题解析不出 OP/ED 时就置空，让该表的行被跳过。
-                caption = clean_wikitext(s[2:])
-                cur_kind = _kind_of(caption)
-                if cur_kind is None and "挿入歌" not in caption and "劇中歌" not in caption:
-                    # 标题不属于主题歌类，也明确置空
-                    cur_kind = None
-                continue
-
-            if s.startswith("!"):
-                head = clean_wikitext(s[1:].strip())
-                if "曲名" in head:              # 表头行
-                    continue
-                # 纯话数行（「1 - 12」「第3話」）→ 记为 pending
-                if head and re.fullmatch(r"[\d\s\-–~〜第話]*", head):
-                    pending_num = head
-                continue
-
-            if not s.startswith("|") or s.startswith("|-"):
-                continue
-            cells = [c for c in (_table_cell(c)
-                                 for c in re.split(r"\|\||!!", s[1:].strip())) if c]
-            if len(cells) < 2:
-                continue
-            title, artist = cells[0], cells[1]
-            if not title:
-                continue
-            kind = cur_kind or _kind_of("".join(cells))
-            if kind is None:
-                continue
-            out.append(WikiTheme(
-                kind=kind, song_title=title,
-                artists=[artist] if artist else [],
-                sequence=None,
-                note=(f"使用話 {pending_num}" if pending_num else "wikitable"),
-                raw=" | ".join(cells)[:200], fmt="table", page=page,
-            ))
-            pending_num = ""
-
-    # 去重（同一首歌可能在 OP/ED 表里各出现一次）
-    seen: set[tuple] = set()
-    uniq: list[WikiTheme] = []
-    for t in out:
-        key = (t.kind, t.song_title, tuple(t.artists))
-        if key not in seen:
-            seen.add(key)
-            uniq.append(t)
-    return uniq
-
+    """兼容段落入口；与匹配流程共用列表及合并单元格解析。"""
+    from .wiki_songs import parse_segment
+    themes = parse_segment(segment, page, '', 'ja')
+    unique = {}
+    for theme in themes:
+        if theme.kind is not None:
+            unique.setdefault((theme.kind, theme.song_title, tuple(theme.artists)), theme)
+    return list(unique.values())
 
 # ---------------------------------------------------------------- 标题校验
 
@@ -508,6 +433,8 @@ class ThemeFetchResult:
     retry_not_before: float = 0
     stopped: bool = False
     diagnostics: dict = field(default_factory=lambda: {'source_language': 'ja'})
+    # 仅本次查询的内存兜底，不能放进需要JSON持久化的diagnostics。
+    all_season_themes: list[WikiTheme] = field(default_factory=list, repr=False)
 
 
 class WikiResponseError(ValueError):
@@ -611,7 +538,14 @@ class WikipediaSource:
         self._request_budget = {'remaining': 18}
         first = self._fetch_single(list(dict.fromkeys(n for n in [title_jp, *names] if n)))
         # 日文的范围歧义只说明该语言资料尚不能安全使用，仍可独立校验中文资料。
-        if self.language != 'ja' or first.reason_code not in ('article_not_found', 'no_theme_section', 'no_usable_themes', 'scope_ambiguous'):
+        if self.language != 'ja':
+            summary = self._language_summary(first)
+            if first.reason_code == 'scope_ambiguous':
+                from .wiki_matching import fallback_result
+                first = fallback_result(first) or first
+            first.diagnostics['language_results'] = [summary]
+            return first
+        if first.reason_code not in ('article_not_found', 'no_theme_section', 'no_usable_themes', 'scope_ambiguous'):
             first.diagnostics['language_results'] = [self._language_summary(first)]
             return first
         if self._zh_source is None:
@@ -619,8 +553,13 @@ class WikipediaSource:
         child = self._zh_source
         child._request_budget = self._request_budget
         second = child._fetch_single(list(dict.fromkeys(n for n in [title_cn, *names] if n)))
-        second.diagnostics['language_results'] = [self._language_summary(first), self._language_summary(second)]
-        second.message = '日文：' + first.message + '；中文：' + (second.message or '已取得可用 OP/ED')
+        summaries = [self._language_summary(first), self._language_summary(second)]
+        if second.reason_code in ('scope_ambiguous', 'article_not_found', 'no_theme_section', 'no_usable_themes'):
+            from .wiki_matching import fallback_result
+            second = fallback_result(second) or fallback_result(first) or second
+        second.diagnostics['language_results'] = summaries
+        second.message = ('日文：' + first.message + '；中文：' + (summaries[1]['message'] or '已取得可用动画歌曲')
+                          + ('；' + second.message if second.diagnostics.get('scope_mode') == 'all_seasons_fallback' else ''))
         if second.reason_code == 'article_not_found' and first.reason_code != 'article_not_found':
             second.reason_code = first.reason_code
             second.article_url = first.article_url
@@ -952,7 +891,7 @@ class WikipediaSource:
         return None, "none"
 
     # ---- 主入口
-    def fetch_themes(self, names: list[str], *, include_interludes: bool = False
+    def fetch_themes(self, names: list[str], *, include_interludes: bool = True
                      ) -> tuple[list[WikiTheme], str]:
         """按番剧名抓主题歌。返回 (主题歌列表, 词条名或空)。
 

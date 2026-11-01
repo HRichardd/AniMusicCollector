@@ -272,6 +272,7 @@ class WizardSession:
                 'source_language': {'ja': '日文', 'zh': '中文'}.get(source_info.get('source_language'), ''),
                 'article_url': source_info.get('article_url', ''),
                 'source_section': source_info.get('section', ''),
+                'scope_review': source_info.get('scope_review', ''),
                 #: 这一行的番在①里有没有被纳入 —— 界面上「已排除」的计数要用它区分
                 #: 「这条曲目被排除了」和「它的番被排除了」（两者都表现为勾没打上）
                 "anime_included": anime_on,
@@ -479,7 +480,9 @@ class WizardSession:
             diag.setdefault('confirmed_types', []).append(dict(item, kind=kind, confirmed_by='human'))
             self.store.set_theme_fetch(anime_id, 'failed' if items else 'success',
                 reason_code='type_unconfirmed' if items else '',
-                message='已找到主题曲，OP/ED 类型待确认' if items else '主题曲类型已由用户确认',
+                message=('歌曲类型待确认（OP／ED／插入曲）' if items else '歌曲类型已由用户确认')
+                        + ('；未能定位目标季，已全季收录，待人工审核' if diag.get('scope_mode') == 'all_seasons_fallback'
+                           else '；包含范围待审核歌曲' if diag.get('review_required') else ''),
                 article_url=state['article_url'], retry_not_before=state['retry_not_before'],
                 saved_count=len(ids), diagnostics=diag)
             self.store.mark_downstream_dirty(self.season_id, Stage.THEME)

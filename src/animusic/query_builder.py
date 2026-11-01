@@ -67,7 +67,7 @@ def pick_anime_name(anime_names: list[str] | None) -> str:
 
 
 def kind_cn(kind: str) -> str:
-    return "片头曲" if (kind or "").upper() == "OP" else "片尾曲"
+    return {"OP": "片头曲", "ED": "片尾曲", "IN": "插入曲"}.get((kind or "").upper(), "主题曲")
 
 
 def build_queries(

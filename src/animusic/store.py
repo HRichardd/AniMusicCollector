@@ -113,7 +113,7 @@ CREATE TABLE IF NOT EXISTS wiki_type_choice (
     article_url TEXT NOT NULL,
     song_title TEXT NOT NULL,
     artists TEXT NOT NULL,
-    kind TEXT NOT NULL CHECK(kind IN ('OP','ED')),
+    kind TEXT NOT NULL CHECK(kind IN ('OP','ED','IN')),
     PRIMARY KEY(anime_id,language,article_url,song_title,artists)
 );
 INSERT OR IGNORE INTO theme_fetch(anime_id) SELECT id FROM anime;
@@ -134,7 +134,7 @@ END;
 CREATE TABLE IF NOT EXISTS theme (
     id         INTEGER PRIMARY KEY,
     anime_id   INTEGER NOT NULL REFERENCES anime(id) ON DELETE CASCADE,
-    kind       TEXT    NOT NULL CHECK (kind IN ('OP','ED')),
+    kind       TEXT    NOT NULL CHECK (kind IN ('OP','ED','IN')),
     sequence   INTEGER,
     song_title TEXT    NOT NULL,
     artists    TEXT    NOT NULL,
@@ -267,6 +267,11 @@ class Store:
         self.conn.executescript(SCHEMA)     # 建表（顺带在当前线程建出第一条连接）
         self._migrate_theme_identity()
         self._migrate_push_selection()
+        try:
+            self._migrate_theme_kinds()
+        except BaseException:
+            self.close()
+            raise
         if 'diagnostics' not in {r['name'] for r in self.conn.execute('PRAGMA table_info(theme_fetch)')}:
             self.conn.execute("ALTER TABLE theme_fetch ADD COLUMN diagnostics TEXT NOT NULL DEFAULT '{}'")
         # 旧限流记录只改归类，保留原始原因、次数和服务端期限，重复打开也安全。
@@ -316,8 +321,8 @@ class Store:
         return row[0] if row else None
 
     def confirm_wiki_type(self, anime_id: int, item: dict, kind: str) -> None:
-        if kind not in ('OP', 'ED'):
-            raise ValueError('主题曲类型必须为 OP 或 ED')
+        if kind not in tuple(ThemeKind):
+            raise ValueError('曲目类型必须为 OP、ED 或 IN（插入曲）')
         self.conn.execute('INSERT INTO wiki_type_choice VALUES(?,?,?,?,?,?) '
             'ON CONFLICT(anime_id,language,article_url,song_title,artists) DO UPDATE SET kind=excluded.kind',
             (anime_id, item['source_language'], item['article_url'], item['song_title'],
@@ -344,6 +349,48 @@ class Store:
                 self.conn.execute("ALTER TABLE push_selection_new RENAME TO push_selection")
             self.conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_push_selection_unbound "
                               "ON push_selection(season_id,netease_song_id) WHERE theme_id IS NULL")
+
+    def _migrate_theme_kinds(self) -> None:
+        # SQLite不能直接修改CHECK；先关当前连接的外键执行原子重建，避免DROP触发级联删除。
+        import re
+        conn = self.conn
+        pending = []
+        for table in ('theme', 'wiki_type_choice'):
+            sql = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()[0]
+            updated = re.sub(r"(CHECK\s*\(\s*kind\s+IN\s*\()\s*'OP'\s*,\s*'ED'\s*(\)\s*\))",
+                             r"\1'OP','ED','IN'\2", sql, flags=re.I)
+            if updated != sql:
+                pending.append((table, updated))
+        if not pending:
+            return
+        conn.commit()
+        legacy = conn.execute('PRAGMA legacy_alter_table').fetchone()[0]
+        conn.execute('PRAGMA foreign_keys=OFF')
+        conn.execute('PRAGMA legacy_alter_table=ON')
+        try:
+            conn.execute('BEGIN IMMEDIATE')
+            for table, ddl in pending:
+                objects = [r[0] for r in conn.execute(
+                    "SELECT sql FROM sqlite_master WHERE tbl_name=? AND type IN ('index','trigger') AND sql IS NOT NULL", (table,))]
+                columns = ','.join('"' + r['name'] + '"' for r in conn.execute(f'PRAGMA table_info({table})'))
+                temp = table + '_kind_migration'
+                ddl = re.sub(r'^(CREATE TABLE\s+)(?:IF NOT EXISTS\s+)?["`\[]?' + table + r'["`\]]?',
+                             r'\1' + temp, ddl, count=1, flags=re.I)
+                conn.execute(ddl)
+                conn.execute(f'INSERT INTO {temp} ({columns}) SELECT {columns} FROM {table}')
+                conn.execute(f'DROP TABLE {table}')
+                conn.execute(f'ALTER TABLE {temp} RENAME TO {table}')
+                for sql in objects:
+                    conn.execute(sql)
+            if conn.execute('PRAGMA foreign_key_check').fetchone() is not None:
+                raise sqlite3.IntegrityError('曲目类别迁移后的外键检查失败')
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        finally:
+            conn.execute(f'PRAGMA legacy_alter_table={int(legacy)}')
+            conn.execute('PRAGMA foreign_keys=ON')
 
     def _migrate_theme_identity(self) -> None:
         columns = {r["name"] for r in self.conn.execute("PRAGMA table_info(theme)")}
@@ -697,7 +744,11 @@ class Store:
                 provenance.append({k: v for k, v in previous_raw.items() if k != 'wikipedia_sources'})
             if t.raw not in provenance:
                 provenance.append(t.raw)
+            # 来源身份继续锚定首次记录，避免跨语言误合并；审核提示则跟随最新查询。
             merged = dict(previous_raw or t.raw, wikipedia_sources=provenance)
+            for key in ('scope_review', 'season_keys', 'scope_mode', 'target_seasons'):
+                if key in t.raw:
+                    merged[key] = t.raw[key]
             self.conn.execute('UPDATE theme SET raw=? WHERE id=?',
                               (json.dumps(merged, ensure_ascii=False), existing['id']))
         fields = {

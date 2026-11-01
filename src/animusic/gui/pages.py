@@ -383,7 +383,7 @@ class ThemePage(BasePage):
         cols = [
             Column("included", "收录", 52, "check", align=Qt.AlignCenter),
             Column("anime", "番剧", 230, "readonly", stretch=True),
-            Column("kind", "类型", 60, "choice", editable=True, choices=["OP", "ED"], align=Qt.AlignCenter),
+            Column("kind", "类型", 75, "choice", editable=True, choices=["OP", "ED", "插入曲"], align=Qt.AlignCenter),
             Column("seq", "序号", 52, "text", editable=True, align=Qt.AlignCenter),
             Column("song_title", "曲名", 240, "text", editable=True),
             Column("artists", "艺人", 180, "text", editable=True),
@@ -392,8 +392,9 @@ class ThemePage(BasePage):
             Column('source_language', '来源语言', 75, 'readonly'),
             Column('article_url', '来源词条', 220, 'readonly'),
             Column('source_section', '来源章节', 160, 'readonly'),
+            Column('scope_review', '范围审核提示', 250, 'readonly'),
         ]
-        super().__init__(1, "② OP/ED 曲目确认", "日文维基优先，中文补充 · 点击匹配按钮后开始查询", cols, parent)
+        super().__init__(1, "② 动画歌曲确认", "日文维基优先，中文补充 · OP／ED／插入曲", cols, parent)
         self.next_btn.setText("确认曲目，下一步 →")
         self.missing = missing
         self.anime_choices: list[tuple[int, str]] = []
@@ -447,12 +448,13 @@ class ThemePage(BasePage):
         self.type_controls = QWidget()
         type_layout = QVBoxLayout(self.type_controls)
         type_layout.setContentsMargins(0, 0, 0, 0)
-        type_layout.addWidget(QLabel('已找到主题曲，OP/ED 类型待确认'))
+        type_layout.addWidget(QLabel('歌曲类型待确认：OP／ED／插入曲'))
         self.untyped_combo = QComboBox()
         self.type_combo = QComboBox()
-        self.type_combo.addItem('请选择 OP／ED', '')
+        self.type_combo.addItem('请选择歌曲类型', '')
         self.type_combo.addItem('OP', 'OP')
         self.type_combo.addItem('ED', 'ED')
+        self.type_combo.addItem('插入曲', 'IN')
         self.confirm_type_btn = _btn('确认所选曲目类型')
         self.confirm_type_btn.setEnabled(False)
         self.type_combo.currentIndexChanged.connect(lambda *_: self.confirm_type_btn.setEnabled(bool(self.type_combo.currentData())))
@@ -496,6 +498,8 @@ class ThemePage(BasePage):
             self.FILTER_ALL: None,
             "仅 OP": lambda r: r.get("kind") == "OP",
             "仅 ED": lambda r: r.get("kind") == "ED",
+            "仅插入曲": lambda r: r.get("kind") == "IN",
+            "范围待审核": lambda r: bool(r.get('scope_review')),
             # 「已排除」= 这一行没打勾。两种原因都算：曲目自己取消了收录，
             # 或者它的番在第①步被排除了（那样勾选框也不该是勾着的）。
             "已排除": lambda r: not r.get("included"),
@@ -560,6 +564,8 @@ class ThemePage(BasePage):
                 row['status_label'] = '类型待确认'
             if state['reason_code'] == 'rate_limited':
                 row['status_label'] += ' · 限流'
+            if state.get('diagnostics', {}).get('review_required'):
+                row['status_label'] += ' · 待审'
             row['attempted_label'] = (datetime.fromtimestamp(state['attempted_at']).strftime('%Y-%m-%d %H:%M:%S')
                                       if state['attempted_at'] is not None else '')
             row['wait_label'] = (datetime.fromtimestamp(state['retry_not_before']).strftime('%Y-%m-%d %H:%M:%S')
@@ -615,10 +621,13 @@ class ThemePage(BasePage):
     def _show_fetch_details(self, row: dict) -> None:
         from html import escape
         diag = row.get('diagnostics') or {}
+        scope_text = {'all_seasons': '动画全季收录', 'season': '目标季度筛选（保留归属不明歌曲）',
+                      'series': '系列具体作品定位', 'all_seasons_fallback': '未能定位目标季，已全季收录，待人工审核'}
         lines = [('番剧', row['anime']), ('状态', row['status_label']),
                  ('原因码', row.get('reason_code', '')), ('说明', row.get('message', '')),
                  ('来源语言', {'ja': '日文维基百科', 'zh': '中文维基百科'}.get(diag.get('source_language'), '未记录')),
                  ('查询阶段', diag.get('query_stage', '')),
+                 ('收录范围', scope_text.get(diag.get('scope_mode'), '未记录')), ('目标季', '、'.join(diag.get('target_seasons', []))),
                  ('尝试次数', row.get('attempts', 0)), ('最近尝试', row.get('attempted_label', '')),
                  ('等待至', row.get('wait_label', '')), ('曲目数（含排除）', row.get('theme_count', 0))]
         lines.extend((key, diag[key]) for key in ('error_code', 'exception_type', 'http_status', 'api_code') if diag.get(key))
@@ -642,7 +651,7 @@ class ThemePage(BasePage):
     def _confirm_type(self) -> None:
         item = self.untyped_combo.currentData()
         if self.selected_anime_id is not None and item and self.type_combo.currentData():
-            self.confirm_type_requested.emit(self.selected_anime_id, item, self.type_combo.currentText())
+            self.confirm_type_requested.emit(self.selected_anime_id, item, self.type_combo.currentData())
 
     def _refresh(self) -> None:
         # 统计条一律是**全量**口径（筛选只影响看到哪几行，不影响这些事实）。
@@ -653,10 +662,11 @@ class ThemePage(BasePage):
         inc = [r for r in all_rows if r.get("included")]
         ops = [r for r in inc if r["kind"] == "OP"]
         eds = [r for r in inc if r["kind"] == "ED"]
+        inserts = [r for r in inc if r['kind'] == 'IN']
         off = [r for r in all_rows if not r.get("included")]
         by_anime = [r for r in off if not r.get("anime_included", True)]
         self.stat.setText(
-            f"OP {len(ops)} · ED {len(eds)} · 合计 {len(inc)} 条"
+            f"OP {len(ops)} · ED {len(eds)} · 插入曲 {len(inserts)} · 合计 {len(inc)} 条"
             + (f"（另 {len(off)} 条已排除" +
                (f"，其中 {len(by_anime)} 条的番在第①步被排除）" if by_anime else "）")
                if off else "")

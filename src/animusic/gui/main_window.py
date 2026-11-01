@@ -1025,7 +1025,7 @@ class MainWindow(QMainWindow):
         }
         self.worker: TaskWorker | None = None
         self._closing = False
-        self.setWindowTitle("AniMusicCollector —— 新番 OP/ED → 网易云歌单")
+        self.setWindowTitle("AniMusicCollector —— 新番动画歌曲 → 网易云歌单")
         self.resize(1500, 980)
 
         central = QWidget()
@@ -1097,7 +1097,7 @@ class MainWindow(QMainWindow):
         # **许可证义务** —— 只要界面开着、只要展示的是维基来的曲目，它就得在场。
         self.credit = QLabel(wikipedia_attribution())
         self.credit.setToolTip(
-            "OP/ED 曲目的主数据源是日文维基百科的「主題歌」栏，正文以 CC BY-SA 4.0 授权。\n"
+            "OP／ED／插入曲曲目的主数据源是日文维基百科的「主題歌」栏，正文以 CC BY-SA 4.0 授权。\n"
             "转发本程序的界面截图或导出的报告时，请一并保留这行署名。")
         self.status.addPermanentWidget(self.credit)
 
@@ -1131,7 +1131,7 @@ class MainWindow(QMainWindow):
         all_anime.setEnabled(False)
 
         theme.add_action("匹配全部番剧曲名", self._fetch_themes, "primary",
-                         "重新查询全部纳入番剧的维基 OP/ED，包括此前成功项目", index=0)
+                         "重新查询全部纳入番剧的维基动画歌曲，包括此前成功项目", index=0)
         theme.add_action("匹配待抓取番剧", self._fetch_pending_themes, "normal",
                          "只查询待抓取番剧，继续补齐取消或限流后未处理的项目", index=1)
         theme.add_action("重新匹配失败番剧曲名", self._retry_failed_themes, "normal",

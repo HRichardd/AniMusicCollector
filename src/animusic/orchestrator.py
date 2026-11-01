@@ -690,7 +690,8 @@ class Orchestrator:
                             if kind:
                                 result.themes.append(WikiTheme(kind=kind, song_title=item['song_title'],
                                     artists=item['artists'], raw=item['raw'], source_language=item['source_language'],
-                                    section=item['section']))
+                                    section=item['section'], scope_review=item.get('scope_review', ''),
+                                    season_keys=tuple(item.get('season_keys', []))))
                             else:
                                 unresolved.append(item)
                         result.diagnostics['untyped_themes'] = unresolved
@@ -720,7 +721,11 @@ class Orchestrator:
                                     included=True, note=theme.note or '',
                                     raw={'source_language': getattr(theme, 'source_language', 'ja'), 'article_url': result.article_url,
                                          'section': getattr(theme, 'section', ''), 'source_text': getattr(theme, 'raw', ''),
-                                         'original_title': theme.song_title})))
+                                         'original_title': theme.song_title,
+                                         'scope_review': getattr(theme, 'scope_review', ''),
+                                         'season_keys': list(getattr(theme, 'season_keys', ())),
+                                         'scope_mode': result.diagnostics.get('scope_mode', ''),
+                                         'target_seasons': result.diagnostics.get('target_seasons', [])})))
                             self._check_cancelled()
                             result.diagnostics['accepted_theme_ids'] = sorted(theme_ids)
                             self.store.set_theme_fetch(aid, 'failed' if result.reason_code else 'success',
@@ -1672,5 +1677,9 @@ class Orchestrator:
                 source_language=source_info.get('source_language', ''),
                 source_url=source_info.get('article_url', ''),
                 source_section=source_info.get('section', ''),
+                scope_review=source_info.get('scope_review', ''),
+                scope_mode=source_info.get('scope_mode', ''),
+                target_seasons='、'.join(source_info.get('target_seasons', [])),
+                source_seasons='、'.join(source_info.get('season_keys', [])),
             )
         return ex.export(out_dir)

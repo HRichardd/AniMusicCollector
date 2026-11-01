@@ -1,50 +1,18 @@
 """维基查询范围与中日文主题歌解析；不从模糊曲名或部数推断季数。"""
 from __future__ import annotations
 
-from dataclasses import dataclass
 import re
 from urllib.parse import quote, unquote
 
-from .wikipedia import (WikiTheme, ThemeFetchResult, WikiResponseError, ThemeKind,
-                        clean_wikitext, canon_title, title_matches, title_variants,
-                        parse_themes, _kind_of, _table_cell)
+from .wikipedia import ThemeFetchResult, clean_wikitext, canon_title, title_matches, title_variants
 
-MAX_SECTION = 120000
+from .wiki_songs import (MAX_SECTION, HEADING, THEME, SEASON, ANIMATION, Section, sections,
+                         season_key, scoped_theme_sections, parse_chinese, parse_scoped, scope_songs)
+
 MAX_CANDIDATES = 36
 MAX_SEARCHES = 4
 MAX_RELATED = 2
-HEADING = re.compile(r'^(={2,6})\s*(.*?)\s*\1\s*$', re.M)
-THEME = re.compile(r'主[題题][歌曲]|オープニング|エンディング|テーマソング|片[頭头尾]曲|^音[楽乐]$')
-SEASON = re.compile(r'(?i)(\d+)(?:st|nd|rd|th)\s*Season|Season\s*(\d+)|第([\d一二三四五六七八九十]+)[期季]|シーズン\s*(\d+)')
 PART = re.compile(r'(?i)Part\s*(\d+)')
-ANIMATION = re.compile(r'アニメ|動[畫画]|动画')
-
-
-@dataclass
-class Section:
-    title: str
-    level: int
-    start: int
-    body: int
-    end: int
-
-
-def sections(text: str) -> list[Section]:
-    matches = list(HEADING.finditer(text))
-    out = []
-    for i, match in enumerate(matches):
-        end = next((m.start() for m in matches[i + 1:] if len(m[1]) <= len(match[1])), len(text))
-        out.append(Section(clean_wikitext(match[2]), len(match[1]), match.start(), match.end(), end))
-    return out
-
-
-def season_key(title: str) -> str:
-    match = SEASON.search(title)
-    if not match:
-        return ''
-    value = next(v for v in match.groups() if v)
-    return str({'一': 1, '二': 2, '三': 3, '四': 4, '五': 5, '六': 6,
-                '七': 7, '八': 8, '九': 9, '十': 10}.get(value, value))
 
 
 def names_for_language(names: list[str], language: str) -> list[str]:
@@ -66,9 +34,6 @@ def query_candidates(names: list[str], language: str) -> list[tuple[str, str]]:
 
 
 def _same_work(name: str, title: str) -> bool:
-    expected, actual = season_key(name), season_key(title)
-    if expected and actual and expected != actual:
-        return False
     p1, p2 = PART.search(name), PART.search(title)
     if p1 and p2 and p1[1] != p2[1]:
         return False
@@ -94,201 +59,63 @@ def related_animation_pages(text: str) -> list[str]:
     return targets[:MAX_RELATED]
 
 
-def scoped_theme_sections(text: str, names: list[str], work_title: str = '', page_title: str = '') -> list[tuple[str, str]]:
-    headings = sections(text)
-    roots = [s for s in headings if THEME.search(s.title)]
-    roots = [s for s in roots if not any(p.start < s.start < p.end for p in roots)]
-    wanted = {season_key(n) for n in names if season_key(n)}
-    keys = [canon_title(work_title)] if work_title else [canon_title(v) for n in names for v in title_variants(n)]
-    mapped = set()
-    for heading in headings:
-        if not season_key(heading.title):
-            continue
-        lead_end = next((s.start for s in headings if heading.body <= s.start < heading.end), heading.end)
-        lead = text[heading.body:min(lead_end, heading.body + 1000)]
-        title_match = any(k and k in canon_title(heading.title) for k in keys)
-        adaptation = work_title and any(re.search(r'改[编編]自|原作\s*[：:=]', line)
-            and canon_title(work_title) in canon_title(clean_wikitext(line)) for line in lead.splitlines())
-        if title_match or adaptation:
-            mapped.add(season_key(heading.title))
-    if mapped:
-        wanted = wanted & mapped if wanted else mapped
-    parent_seasons = {season_key(p.title) for root in roots for p in headings
-                      if p.start < root.start < p.end and season_key(p.title)}
-    if len(parent_seasons) > 1 and len(wanted) != 1:
-        raise WikiResponseError('词条已找到，目标季度范围不明确', 'scope_ambiguous')
-    selected = []
-    unspecified = []
-    for root in roots:
-        if root.end - root.body > MAX_SECTION:
-            raise WikiResponseError('主题歌章节超过安全长度，需人工核对', 'section_too_large')
-        root_season = season_key(root.title)
-        if root_season and wanted:
-            if root_season in wanted:
-                selected.append((root.title, text[root.body:root.end]))
-            continue
-        groups = [s for s in headings if root.body <= s.start < root.end and season_key(s.title)]
-        # 同一季下面可能还有子栏目；只把最外层季标题当作互斥分组。
-        groups = [s for s in groups if not any(p.start < s.start < p.end for p in groups)]
-        if not groups:
-            # 多季以「主题歌」散布在各季父章节时，也必须先选择目标父章节。
-            parents = [s for s in headings if s.start < root.start < s.end and season_key(s.title)]
-            if parents:
-                parent = max(parents, key=lambda s: s.level)
-                if wanted and season_key(parent.title) not in wanted:
-                    continue
-                if not wanted:
-                    if not any(k and k in canon_title(parent.title) for k in keys):
-                        raise WikiResponseError('词条已找到，目标季度范围不明确', 'scope_ambiguous')
-                selected.append((parent.title + ' / ' + root.title, text[root.body:root.end]))
-                continue
-            body = text[root.body:root.end]
-            labels = list(re.finditer(r'(?m)^;\s*(第[\d一二三四五六七八九十]+[期季])\s*$', body))
-            if labels:
-                if len(wanted) != 1:
-                    raise WikiResponseError('词条已找到，目标季度范围不明确', 'scope_ambiguous')
-                for i, label in enumerate(labels):
-                    if season_key(label[1]) in wanted:
-                        end = labels[i + 1].start() if i + 1 < len(labels) else len(body)
-                        selected.append((root.title + ' / ' + label[1], body[label.end():end]))
-                continue
-            # 季数也会写在歌曲说明中，不能只认章节标题；不收未标季数的邻近曲目。
-            blocks = list(re.finditer(r'(?ms)^;[^\n]*\n:.*?(?=^;|\Z)', body))
-            tagged = [(m.group(), season_key(clean_wikitext(m.group()))) for m in blocks]
-            if any(key for _, key in tagged):
-                if len(wanted) != 1:
-                    raise WikiResponseError('词条已找到，目标季度范围不明确', 'scope_ambiguous')
-                matching = [block for block, key in tagged if key in wanted]
-                if matching:
-                    selected.append((root.title + ' / 第' + next(iter(wanted)) + '期（曲目说明）', '\n'.join(matching)))
-                continue
-            unspecified.append((root.title, body))
-            continue
-        matches = [g for g in groups if season_key(g.title) in wanted]
-        if not wanted or len(matches) > 1:
-            raise WikiResponseError('词条已找到，目标季度范围不明确', 'scope_ambiguous')
-        if not matches:
-            continue
-        group = matches[0]
-        selected.append((root.title + ' / ' + group.title, text[group.body:group.end]))
-    if not selected and unspecified and len(roots) == 1 and (not wanted or season_key(page_title) in wanted):
-        selected = unspecified
-    if not selected and roots:
-        raise WikiResponseError('词条已找到，未能定位目标季度主题歌', 'scope_ambiguous')
-    return selected
 
 
-def _kind(text: str):
-    if re.search(r'片[頭头](?:主[題题])?曲|開場曲|开场曲|\bOP\b', text, re.I):
-        return ThemeKind.OP
-    if re.search(r'片尾(?:主[題题])?曲|結尾曲|结尾曲|\bED\b', text, re.I):
-        return ThemeKind.ED
-    return _kind_of(text)
+def work_aliases(text: str):
+    values = re.findall(r'(?mi)^\|\s*(?:日文[名名稱称]+|japanese|タイトル|標題|标题|title)\s*=\s*([^\n]+)', text)
+    return [clean_wikitext(v) for v in values if clean_wikitext(v)]
 
 
-def _artist(text: str) -> str:
-    for line in text.splitlines():
-        match = re.search(r'(?:演唱|主唱|歌手|歌唱|歌)\s*[：:]\s*(.+)', clean_wikitext(line))
-        if match:
-            return match[1].split('，')[0].split('；')[0].strip()
+def reference_work(text: str, names: list[str], canonical: str):
+    bases = [canon_title(v) for name in names for v in title_variants(name)]
+    if canon_title(canonical) in bases:
+        return ''
+    # 重定向到系列总页时，从页面明确的链接／标题关系恢复具体作品身份。
+    candidates = [*work_aliases(text), *re.findall(r'\[\[([^\]|#]+)(?:[^\]]*)\]\]', text)]
+    for candidate in sorted(set(candidates), key=lambda s: (-len(s), s)):
+        key = canon_title(candidate)
+        if len(key) >= 4 and key != canon_title(canonical) and any(key in base for base in bases):
+            if any(season_key(h.title) and key in canon_title(h.title) for h in sections(text)):
+                return candidate
+    seasons = {season_key(h.title) for h in sections(text) if season_key(h.title)}
+    canonical_key = canon_title(canonical)
+    if len(seasons) > 1 and any(canonical_key and canonical_key in base and canonical_key != base for base in bases):
+        # 已知具体作品重定向到其系列总页，即使尚无映射也不能冒充“无季数普通作品”。
+        return title_variants(names[0])[-1]
     return ''
 
 
-def parse_chinese(text: str, page: str, context: str = '') -> list[WikiTheme]:
-    out = []
-    normalized = []
-    current_kind = _kind(context)
-    for line in text.splitlines():
-        if re.fullmatch(r';\s*片[頭头尾](?:主[題题])?曲\s*', line):
-            current_kind = _kind(line)
+def song_result(themes, url, diag, reason='', message=''):
+    typed, unknown = [], []
+    seen = set()
+    for song in themes:
+        key = (song.kind, song.song_title, tuple(song.artists))
+        if key in seen:
             continue
-        if re.match(r'^:;+\s*', line):
-            line = re.sub(r'^:;+\s*', '; ' + (str(current_kind) + ' ' if current_kind else ''), line)
-        normalized.append(line)
-    text = '\n'.join(normalized)
-    # 定义列表和星号列表均按同级条目分块，演唱信息可位于下一层。
-    blocks = re.findall(r'(?ms)^(?:;|\*(?!\*))\s*(.*?)(?=^(?:;|\*(?!\*))|\Z)', text)
-    for block in blocks:
-        if re.search(r'插[入曲]|劇中歌|剧中歌', block[:60]):
-            continue
-        first = block.splitlines()[0]
-        title_match = re.search(r'[「『《"](.+?)[」』》"]', clean_wikitext(first))
-        if title_match:
-            title = title_match[1]
+        seen.add(key)
+        song.source_language = diag['source_language']
+        if song.kind is None:
+            unknown.append(dict(song_title=song.song_title, artists=song.artists, raw=song.raw,
+                source_language=song.source_language, article_url=url, section=song.section,
+                scope_review=song.scope_review, season_keys=list(song.season_keys),
+                scope_mode=diag.get('scope_mode', ''), target_seasons=diag.get('target_seasons', [])))
         else:
-            title = clean_wikitext(first).strip('：: ')
-            title = re.sub(r'^(?:片[頭头尾]曲|主[題题][歌曲])\s*[：:]?\s*', '', title)
-        if not title or len(title) > 180 or re.match(r'^(?:歌|作詞|作词|作曲|編曲|编曲)[：:]', title):
-            continue
-        out.append(WikiTheme(kind=_kind(first) or _kind(context), song_title=title,
-                             artists=[_artist(block)] if _artist(block) else [],
-                             page=page, raw=block[:1000], fmt='list'))
-    # 表头决定列含义，支持一行多列和分行单元格；不猜测使用话数列是曲名。
-    for table in re.findall(r'(?s)\{\|.*?\|\}', text):
-        caption = re.search(r'(?m)^\|\+\s*(.*)', table)
-        kind = _kind(caption[1]) if caption else _kind(context)
-        headers = []
-        rows = []
-        cells = []
-        for line in table.splitlines()[1:]:
-            line = line.strip()
-            if line.startswith('|-') or line == '|}':
-                if cells:
-                    rows.append(cells)
-                    cells = []
-            elif line.startswith('!'):
-                headers.extend(_table_cell(c) for c in re.split(r'!!', line[1:]))
-            elif line.startswith('|') and not line.startswith('|+'):
-                cells.extend(_table_cell(c) for c in re.split(r'\|\|', line[1:]))
-        title_col = next((i for i, h in enumerate(headers) if re.search(r'曲名|歌名|歌曲', h)), None)
-        artist_col = next((i for i, h in enumerate(headers) if re.search(r'歌手|演唱|主唱', h)), None)
-        type_col = next((i for i, h in enumerate(headers) if re.search(r'類型|类型|類別|类别', h)), None)
-        if title_col is None:
-            continue
-        for row in rows:
-            if title_col >= len(row):
-                continue
-            title = row[title_col].strip('「」『』《》" ')
-            artist = row[artist_col] if artist_col is not None and artist_col < len(row) else ''
-            row_kind = _kind(row[type_col]) if type_col is not None and type_col < len(row) else kind
-            if title:
-                out.append(WikiTheme(kind=row_kind, song_title=title, artists=[artist] if artist else [],
-                                     page=page, raw=' | '.join(row), fmt='table'))
-    return out
+            typed.append(song)
+    diag['untyped_themes'] = unknown
+    diag['sections'] = list(dict.fromkeys(s.section for s in themes))
+    if not reason and unknown:
+        reason = 'type_unconfirmed'
+        message = (message + '；' if message else '') + '歌曲类型待确认（OP／ED／插入曲）'
+    return ThemeFetchResult(themes=typed, article_url=url, reason_code=reason, message=message, diagnostics=diag)
 
 
-def parse_scoped(text: str, page: str, names: list[str], language: str, work_title: str = ''):
-    out = []
-    locations = []
-    for location, body in scoped_theme_sections(text, names, work_title, page):
-        # 拆开嵌套OP/ED标题，让中文列表和无caption的表格继承明确类型。
-        headings = sections(body)
-        typed = [s for s in headings if _kind(s.title)]
-        if typed:
-            parts = [(location, body[:typed[0].start])]
-            parts.extend((location + ' / ' + s.title, body[s.body:s.end]) for s in typed)
-        else:
-            parts = [(location, body)]
-        for section, segment in parts:
-            if language == 'ja' and _kind(section):
-                label = 'オープニングテーマ' if _kind(section) == ThemeKind.OP else 'エンディングテーマ'
-                segment = re.sub(r'(?m)^:\s*(.+)$', lambda m: m[0] if _kind(m[1]) else
-                                 ': ' + m[1] + 'による' + label, segment)
-                if '{|' in segment and '|+' not in segment:
-                    segment = re.sub(r'(?m)^(\{\|[^\n]*)(\n)', r'\1\2|+ ' + label + '\n', segment)
-            themes = parse_chinese(segment, page, section) if language == 'zh' else parse_themes(segment, page)
-            for theme in themes:
-                if theme.is_interlude:
-                    continue
-                theme.source_language = language
-                theme.section = section
-                out.append(theme)
-                if section not in locations:
-                    locations.append(section)
-    unique = {}
-    for theme in out:
-        unique.setdefault((theme.kind, theme.song_title, tuple(theme.artists)), theme)
-    return list(unique.values()), locations
+def fallback_result(result):
+    if not result.all_season_themes:
+        return None
+    from dataclasses import replace
+    songs = [replace(s, scope_review='未能定位目标季，已全季收录，待人工审核') for s in result.all_season_themes]
+    diag = dict(result.diagnostics, scope_mode='all_seasons_fallback', scope_resolved=False, review_required=True)
+    return song_result(songs, result.article_url, diag, message='未能定位目标季，已全季收录，待人工审核')
 
 
 def fetch_scoped(source, names: list[str]) -> ThemeFetchResult:
@@ -305,32 +132,20 @@ def fetch_scoped(source, names: list[str]) -> ThemeFetchResult:
         visited.add(canonical)
         source._inspected_pages[page] = text
         url = f'https://{source.host}/wiki/{quote(canonical.replace(" ", "_"))}'
-        source._query_stage = '选择主题歌章节'
-        try:
-            if depth == 0 and season_key(original) and season_key(canonical) and season_key(original) != season_key(canonical):
-                raise WikiResponseError('词条指向其它季度，未导入曲目', 'scope_ambiguous')
-            themes, locations = parse_scoped(text, canonical, names, source.language, work)
-        except WikiResponseError as exc:
-            if exc.error_code != 'scope_ambiguous':
-                raise
-            return ThemeFetchResult(article_url=url, reason_code='scope_ambiguous', message=str(exc),
-                diagnostics={'source_language': source.language, 'query_stage': source._query_stage,
-                             'error_code': exc.error_code, 'lookup_trace': list(trace)})
         trace.append({'candidate': page, 'canonical': canonical, 'query_name': original, 'how': how})
-        diag = {'source_language': source.language, 'query_stage': '解析主题歌',
-                'sections': locations, 'lookup_trace': list(trace)}
-        if themes:
-            typed = [t for t in themes if t.kind is not None]
-            unknown = [dict(song_title=t.song_title, artists=t.artists, raw=t.raw,
-                            source_language=source.language, article_url=url, section=t.section)
-                       for t in themes if t.kind is None]
-            diag['untyped_themes'] = unknown
-            return ThemeFetchResult(themes=typed, article_url=url,
-                reason_code='type_unconfirmed' if unknown else '',
-                message='已找到主题曲，OP/ED 类型待确认' if unknown else '', diagnostics=diag)
+        work = work or reference_work(text, names, canonical)
+        source._query_stage = '解析动画歌曲及季度范围'
+        chosen, all_themes, scope = scope_songs(text, canonical, names, source.language, work)
+        diag = dict(scope, source_language=source.language, query_stage=source._query_stage, lookup_trace=list(trace))
+        if all_themes:
+            if not scope['scope_resolved']:
+                result = song_result(chosen, url, diag, 'scope_ambiguous', '词条已找到，未能定位目标季度，待中文补充或全季审核')
+                result.all_season_themes = all_themes
+                return result
+            return song_result(chosen, url, diag, message='部分歌曲季度归属不确定，已保留供人工审核' if scope['review_required'] else '')
         no_section = not any(THEME.search(s.title) for s in sections(text))
         result = ThemeFetchResult(article_url=url, reason_code='no_theme_section' if no_section else 'no_usable_themes',
-            message='词条无主题歌栏目' if no_section else '未解析出可用 OP/ED', diagnostics=diag)
+            message='词条无动画歌曲栏目' if no_section else '未解析出可用动画歌曲', diagnostics=diag)
         if best is None or not no_section:
             best = result
         if depth < 2:
@@ -360,7 +175,9 @@ def fetch_scoped(source, names: list[str]) -> ThemeFetchResult:
                     if not reference or not (mapped or adapted or same_title):
                         trace.append({'candidate': target, 'how': 'related_skipped', 'reason': 'work_identity_unconfirmed'})
                         continue
-                    found = inspect(target, related, 'related_animation', original, depth + 1, work or canonical)
+                    multi_season = len({season_key(s.title) for s in related_sections if season_key(s.title)}) > 1
+                    found = inspect(target, related, 'related_animation', original, depth + 1,
+                                    (work or canonical) if mapped or multi_season else '')
                     if found:
                         return found
         return None
@@ -386,15 +203,18 @@ def fetch_scoped(source, names: list[str]) -> ThemeFetchResult:
         for hit in keep:
             if got.get(hit):
                 variants = [hit, *source._page_variants.get(hit, [])]
-                original_fields = re.findall(r'(?m)^\|\s*日文[名名稱称]+\s*=\s*([^\n]+)', got[hit])
-                identity = any(_same_work(name, v) for v in variants)
-                identity = identity or any(canon_title(clean_wikitext(v)) == canon_title(n)
-                                           for v in original_fields for n in names)
+                original_fields = work_aliases(got[hit])
+                identity = any(_same_work(n, v) for n in names for v in variants)
+                identity = identity or any(_same_work(n, v) for v in original_fields for n in names)
                 if not identity:
                     source.stats['rejected_title'] += 1
+                    trace.append({'candidate': hit, 'how': 'search_rejected', 'reason': 'work_identity_unconfirmed'})
                     continue
                 found = inspect(hit, got[hit], 'search', name)
                 if found:
                     return found
-    return best or ThemeFetchResult(reason_code='article_not_found', message='未找到匹配词条',
+    if best:
+        best.diagnostics['lookup_trace'] = list(trace)
+        return best
+    return ThemeFetchResult(reason_code='article_not_found', message='未找到匹配词条',
         diagnostics={'source_language': source.language, 'query_stage': '查找词条', 'lookup_trace': trace})

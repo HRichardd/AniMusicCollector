@@ -60,14 +60,15 @@ class MemoryWiki:
 
 
 class TestWikiScope(unittest.TestCase):
-    def test_season_in_song_descriptions_skips_older_root_and_untagged_ova(self):
+    def test_season_in_song_descriptions_excludes_old_season_and_keeps_uncertain_ova(self):
         text = ('== 主題歌（旧版） ==\n=== 第1期 ===\n; 「旧OP」\n: 歌手によるオープニングテーマ。\n'
                 '== 主題歌（OVA） ==\n;「OVA」\n:歌手によるエンディングテーマ。\n'
                 '== 主題歌（新版） ==\n;「第一期」\n:歌手による第1期のオープニングテーマ。\n'
                 ';「第三期OP」\n:歌手による第3期のオープニングテーマ。\n'
                 ';「第三期ED」\n:歌手による第3期のエンディングテーマ。\n')
         themes, _ = parse_scoped(text, '作品', ['作品 第3期'], 'ja')
-        self.assertEqual([(t.kind, t.song_title) for t in themes], [('OP', '第三期OP'), ('ED', '第三期ED')])
+        self.assertEqual([(t.kind, t.song_title) for t in themes], [('ED', 'OVA'), ('OP', '第三期OP'), ('ED', '第三期ED')])
+        self.assertTrue(themes[0].scope_review)
 
     def test_chinese_definition_season_labels_and_row_types_select_only_target(self):
         table = ('{| class="wikitable"\n! 類別 !! 歌曲 !! 演唱\n|-\n'
@@ -106,18 +107,18 @@ class TestWikiScope(unittest.TestCase):
         self.assertEqual([t.song_title for t in themes], ['対象のOP'])
         self.assertEqual(locations, ['主題歌 / 6th Season'])
 
-    def test_ambiguous_seasons_reject_all_instead_of_first(self):
+    def test_name_without_season_collects_all_instead_of_first(self):
         text = '== 主題歌 ==\n=== 1st Season ===\n;「甲」\n:歌手によるオープニングテーマ。\n=== 2nd Season ===\n;「乙」\n:歌手によるオープニングテーマ。'
-        with self.assertRaisesRegex(WikiResponseError, '范围不明确'):
-            parse_scoped(text, '総合', ['作品'], 'ja')
+        themes, _ = parse_scoped(text, '総合', ['作品'], 'ja')
+        self.assertEqual([t.song_title for t in themes], ['甲', '乙'])
 
     def test_theme_sections_under_different_season_parents_do_not_mix(self):
         text = '== 第1期 ==\n' + ja_song('第一季').replace('== 主題歌 ==', '=== 主題歌 ===')
         text += '\n== 第2期 ==\n' + ja_song('第二季').replace('== 主題歌 ==', '=== 主題歌 ===')
         themes, _ = parse_scoped(text, '作品', ['作品 第2期'], 'ja')
         self.assertEqual([t.song_title for t in themes], ['第二季'])
-        with self.assertRaises(WikiResponseError):
-            parse_scoped(text, '作品', ['作品'], 'ja')
+        themes, _ = parse_scoped(text, '作品', ['作品'], 'ja')
+        self.assertEqual([t.song_title for t in themes], ['第一季', '第二季'])
 
     def test_related_links_are_animation_main_templates_only(self):
         text = '== 漫画 ==\n{{Main|無関係}}\n== WEBアニメ ==\n[[普通リンク]]\n{{Main|正しいアニメ}}\n{{Main|en:Other}}\n'
@@ -216,28 +217,30 @@ class TestWikiLanguageFlow(unittest.TestCase):
                 self.assertEqual(result.reason_code, reason)
                 self.assertIsNone(source._zh_source)
     def test_japanese_ambiguity_falls_back_but_chinese_scope_is_independent(self):
-        ambiguous = '== 主題歌 ==\n=== 1st Season ===\n甲\n=== 2nd Season ===\n乙'
-        memory = MemoryWiki({('ja', '作品'): ambiguous, ('zh', '作品'): zh_song('中文安全结果')})
+        ambiguous = ('== 主題歌 ==\n=== 1st Season ===\n;「甲」\n:歌手によるオープニングテーマ。\n'
+                     '=== 2nd Season ===\n;「乙」\n:歌手によるエンディングテーマ。')
+        memory = MemoryWiki({('ja', '作品'): ambiguous, ('zh', '作品'): zh_song('中文安全结果').replace('== 主題曲 ==', '== 主題曲（第3季） ==')})
         source = memory.source()
-        result = source.fetch_result(['作品'])
+        result = source.fetch_result(['作品 第3期'])
         self.assertEqual([t.song_title for t in result.themes], ['中文安全结果'])
         self.assertEqual(result.reason_code, '')
         self.assertEqual(result.diagnostics['language_results'][0]['reason_code'], 'scope_ambiguous')
         source.begin_round()
-        self.assertEqual(source.fetch_result(['作品']).themes[0].song_title, '中文安全结果')
+        self.assertEqual(source.fetch_result(['作品 第3期']).themes[0].song_title, '中文安全结果')
         memory.pages[('zh', '作品')] = ambiguous
-        result = memory.source().fetch_result(['作品'])
-        self.assertEqual(result.reason_code, 'scope_ambiguous')
-        self.assertFalse(result.themes)
+        result = memory.source().fetch_result(['作品 第3期'])
+        self.assertEqual(result.reason_code, '')
+        self.assertEqual([t.song_title for t in result.themes], ['甲', '乙'])
+        self.assertEqual(result.diagnostics['scope_mode'], 'all_seasons_fallback')
         self.assertEqual([r['reason_code'] for r in result.diagnostics['language_results']],
                          ['scope_ambiguous', 'scope_ambiguous'])
 
     def test_japanese_ambiguity_then_chinese_network_failure_keeps_both_reasons(self):
-        memory = MemoryWiki({('ja', '作品'): '== 主題歌 ==\n=== 1st Season ===\n甲\n=== 2nd Season ===\n乙',
+        memory = MemoryWiki({('ja', '作品'): ja_song('前季').replace('== 主題歌 ==', '== 主題歌（第1期） =='),
                             ('zh', '作品'): TimeoutError('中文超时')})
-        result = memory.source().fetch_result(['作品'])
+        result = memory.source().fetch_result(['作品 第3期'])
         self.assertEqual(result.reason_code, 'timeout')
-        self.assertIn('范围不明确', result.message)
+        self.assertIn('未能定位目标季度', result.message)
         self.assertIn('中文超时', result.message)
         self.assertEqual([r['reason_code'] for r in result.diagnostics['language_results']], ['scope_ambiguous', 'timeout'])
 
@@ -275,12 +278,13 @@ class TestWikiLanguageFlow(unittest.TestCase):
         self.assertEqual(first_zh['titles'][0].split('|')[0], '中文名称')
         self.assertTrue(result.themes)
 
-    def test_conflicting_sequel_redirect_does_not_import_other_season(self):
+    def test_conflicting_sequel_redirect_is_preserved_for_manual_fallback(self):
         memory = MemoryWiki({('ja', '作品 第3期'): ja_song('错误续作')},
                             aliases={('ja', '作品 第2期 (アニメ)'): '作品 第3期'})
         result = memory.source().fetch_result(['作品 第2期'])
-        self.assertEqual(result.reason_code, 'scope_ambiguous')
-        self.assertFalse(result.themes)
+        self.assertEqual(result.reason_code, '')
+        self.assertEqual([t.song_title for t in result.themes], ['错误续作'])
+        self.assertEqual(result.diagnostics['scope_mode'], 'all_seasons_fallback')
         self.assertEqual(result.diagnostics['language_results'][0]['reason_code'], 'scope_ambiguous')
 
     def test_language_caches_do_not_mix_and_new_round_refetches(self):

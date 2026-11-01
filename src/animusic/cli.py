@@ -136,7 +136,7 @@ def cmd_doctor(args) -> int:
         s = Season.parse(args.season)
         animes = at.fetch_season(s)
         out(f"AnimeThemes  OK  {s.key} 共 {len(animes)} 部"
-            f"（有 OP/ED 的 {len([a for a in animes if a.themes])} 部）"
+            f"（有动画歌曲的 {len([a for a in animes if a.themes])} 部）"
             f" —— 仅作**回退**路径")
     except Exception as e:  # noqa: BLE001
         out(f"AnimeThemes  失败：{type(e).__name__}: {e}", "red")
@@ -676,7 +676,7 @@ def _db_note() -> str:
 
 def cmd_fetch(args) -> int:
     season = Season.parse(args.season)
-    head(f"拉取番单与 OP/ED —— {season.key} ({season.label})")
+    head(f"拉取番单与动画歌曲 —— {season.key} ({season.label})")
     orch = _orch(_progress)
     try:
         rep = orch.fetch_season(season, retry_missing=args.retry_missing)
@@ -771,7 +771,7 @@ def cmd_export(args) -> int:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="animusic",
-        description="每季度把新番 OP/ED 整理进网易云歌单",
+        description="每季度把新番动画歌曲 整理进网易云歌单",
     )
     p.add_argument("--verbose", "-v", action="store_true", help="打印异常堆栈")
     p.add_argument("--db", default=None,
@@ -814,7 +814,7 @@ def build_parser() -> argparse.ArgumentParser:
                     help="连自动结果一起学（默认只学人工确认的，更安全）")
     al.set_defaults(func=cmd_aliases)
 
-    f = sub.add_parser("fetch", help="读在看列表 + 拉 OP/ED")
+    f = sub.add_parser("fetch", help="读在看列表 + 拉动画歌曲")
     f.add_argument("--season", default=_season_default,
                         help="季度，形如 2026Q4（默认=今天所在的季度）")
     f.add_argument("--retry-missing", action="store_true",

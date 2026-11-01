@@ -46,7 +46,7 @@ class Target:
     song_title: str
     artists: list[str]
     anime_names: list[str]
-    kind: str = "OP"          # OP / ED
+    kind: str = "OP"          # OP / ED / IN
     aliases: Any = None
 
     _titles: list[str] | None = field(default=None, repr=False, compare=False)
@@ -164,7 +164,7 @@ def anime_alias_match(cand_alias: list[str] | str | None, target: Target) -> flo
         return 0.0
     kind_ok = (target.kind == "OP" and "片头" in blob) or (
         target.kind == "ED" and "片尾" in blob
-    )
+    ) or (target.kind == "IN" and any(word in blob for word in ("插曲", "插入曲", "挿入歌", "剧中歌", "劇中歌")))
     return 1.0 if kind_ok else 0.4
 
 

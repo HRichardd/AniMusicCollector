@@ -93,6 +93,7 @@ class ExportCollector:
                     # 等于把署名一起丢了（`Theme.source`，不是猜出来的）。
                     "source",
                     'source_language', 'source_url', 'source_section',
+                    'scope_review', 'scope_mode', 'target_seasons', 'source_seasons',
                 ],
                 extrasaction="ignore",
             )
@@ -165,7 +166,7 @@ class ExportCollector:
         return (
             f"# {self.season_key} 数据来源与许可\n\n"
             f"> {ATTRIBUTION}\n\n"
-            "维基百科（日文优先、中文补充）是本报告 OP/ED 曲目的**主数据源**，其正文以\n"
+            "维基百科（日文优先、中文补充）是本报告 OP／ED／插入曲曲目的**主数据源**，其正文以\n"
             "**CC BY-SA 4.0** 授权。**转发、再分发本报告（含 CSV / 歌单清单）时\n"
             "必须保留上面这行署名**，并以同样的许可分发衍生内容。\n\n"
             "## CSV 的 `source` 列是什么意思\n\n"

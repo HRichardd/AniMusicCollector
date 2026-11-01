@@ -129,11 +129,12 @@ class FilterTestBase(unittest.TestCase):
 
     def theme_page(self) -> "ThemePage":
         # 夹具必须让**每一个**筛选项都能筛出严格子集（下面那条守卫测试会检查），
-        # 所以这里刻意覆盖：OP/ED、已排除（曲目自己取消的）、手工补充、
+        # 所以这里刻意覆盖：OP/ED/插入曲、范围待审、已排除、手工补充、
         # 以及"它的番在第①步被排除"那种（anime_included=False）。
         rows = [
             theme_row("番A", "OP"),
             theme_row("番A", "ED"),
+            {**theme_row("番A", "IN"), 'scope_review': '季度归属不确定，待人工审核'},
             {**theme_row("番B", "OP"), "included": False, "anime_included": False},
             {**theme_row("番C", "OP"), "included": False},
             {**theme_row("番D", "OP"), "origin": "manual", "origin_label": "手工"},

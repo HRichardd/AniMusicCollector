@@ -211,6 +211,8 @@ class ComboDelegate(QStyledItemDelegate):
 
     def setEditorData(self, editor, index):  # noqa: N802
         val = index.data(Qt.EditRole)
+        if val == 'IN' and '插入曲' in self.choices:
+            val = '插入曲'
         i = editor.findText(str(val))
         editor.setCurrentIndex(max(0, i))
 
@@ -266,6 +268,8 @@ class DictTableModel(QAbstractTableModel):
         if role in (Qt.DisplayRole, Qt.EditRole):
             if col.kind == "check":
                 return None
+            if role == Qt.DisplayRole and col.key == 'kind' and val == 'IN':
+                return '插入曲'
             if col.key in ("score",) or col.kind == "score":
                 try:
                     return f"{float(val):.2f}"
@@ -343,6 +347,8 @@ class DictTableModel(QAbstractTableModel):
             return True
 
         if role == Qt.EditRole and col.editable:
+            if col.key == 'kind' and value == '插入曲':
+                value = 'IN'
             self._record(index.row(), row, col.key, row.get(col.key), value)
             row[col.key] = value
             self.dataChanged.emit(index, index)

@@ -18,6 +18,7 @@ from typing import Any
 class ThemeKind(StrEnum):
     OP = "OP"
     ED = "ED"
+    IN = "IN"
 
 
 class Origin(StrEnum):

@@ -65,7 +65,7 @@ TABLE_FORMAT = """
 | [[花になって]] || [[緑黄色社会]] || 長屋晴子
 |-
 ! 13 - 24
-| colspan="2"| [[アンビバレント (Uruの曲)|アンビバレント]] || Uru
+| [[アンビバレント (Uruの曲)|アンビバレント]] || colspan="2"| Uru
 |}
 """
 
@@ -99,16 +99,10 @@ class TestListFormat(unittest.TestCase):
         got = {t.song_title: t for t in parse_themes(LIST_FORMAT)}
         self.assertIn("鬼事", got, "[[A|B]] 应取显示文本 B")
 
-    def test_interlude_excluded(self):
-        """挿入歌不属于 OP/ED，**必须被排除** —— 混进歌单就是错的。
-
-        （列表格式里它们连 kind 都判不出来，于是直接被跳过；
-        表格格式里则靠 `|+ 挿入歌` 标题把 kind 置空。
-        两条路都不该让它出现。）
-        """
-        titles = [t.song_title for t in parse_themes(LIST_FORMAT)]
-        self.assertNotIn("今すぐOTETSUKI☆", titles, "挿入歌混进来了")
-        self.assertEqual(len(titles), 3)
+    def test_interlude_has_its_own_category(self):
+        got = {t.song_title: t for t in parse_themes(LIST_FORMAT)}
+        self.assertEqual(got['今すぐOTETSUKI☆'].kind, ThemeKind.IN)
+        self.assertEqual(len(got), 4)
 
     def test_sequence_extracted(self):
         got = {t.song_title: t for t in parse_themes(LIST_FORMAT)}
@@ -157,7 +151,7 @@ class TestTableFormat(unittest.TestCase):
         got = parse_themes(TABLE_WITH_INTERLUDE)
         titles = [t.song_title for t in got]
         self.assertIn("アイコトバ", titles)
-        self.assertNotIn("明日を訪ねて", titles, "挿入歌被当成了 ED")
+        self.assertEqual(next(t.kind for t in got if t.song_title == '明日を訪ねて'), ThemeKind.IN)
 
     def test_header_row_skipped(self):
         got = parse_themes(TABLE_FORMAT)
