@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
 from . import style
 from .anime_table import AnimeTableModel, AnimeTableView
 from .session import STATUS_LABEL
+from .theme_table import ThemeTableModel, ThemeTableView
 from .widgets import CandidateItem, Column, DictTableModel, DictTableView
 from ..models import SeasonBucket
 
@@ -473,8 +474,9 @@ class ThemePage(BasePage):
         right_layout.addLayout(scope)
         right_layout.addLayout(filters)
 
-        self.model = DictTableModel(cols, rows)
-        self.table = self.make_table(self.model)
+        self.model = ThemeTableModel(cols, rows)
+        self.model.log.connect(self.log.emit)
+        self.table = self.make_table(self.model, ThemeTableView)
         self.table.add_handler = self._add
         right_layout.addWidget(self.table, 1)
         self.splitter.addWidget(left)
@@ -509,12 +511,16 @@ class ThemePage(BasePage):
 
     def _set_all(self, v: bool) -> None:
         rows = self.visible_rows()
+        scope = self._scope_hint()
+        changed = 0
         for r in rows:
-            r["included"] = v
-            if "theme_included" in r:
-                r["theme_included"] = v
-        self._emit_all_changed()
-        self.log.emit(f"全部{'收录' if v else '排除'}：当前显示 {len(rows)} 行{self._scope_hint()}")
+            if bool(r.get('theme_included', r.get('included'))) != v:
+                index = next(i for i, item in enumerate(self.model.rows) if item is r)
+                self.model.setData(self.model.index(index, 0), v, Qt.CheckStateRole)
+                changed += 1
+        if changed:
+            self.log.emit(f"全部{'收录' if v else '排除'}：当前显示 {len(rows)} 行{scope}，变更 {changed} 行（待保存）")
+        self._apply_filter(self._view, log=False)
 
     def _add(self) -> None:
         if not self.anime_choices:

@@ -10,7 +10,7 @@ from PySide6.QtGui import QKeyEvent
 from PySide6.QtWidgets import QApplication
 
 from animusic.gui.pages import AnimePage, ThemePage
-from animusic.gui.widgets import DictTableModel, DictTableView
+from animusic.gui.theme_table import ThemeTableModel, ThemeTableView
 
 
 def anime(name, **values):
@@ -56,7 +56,8 @@ class TestAnimeControls(unittest.TestCase):
         event = SimpleNamespace(pos=lambda: QPoint(), globalPos=lambda: QPoint())
         with patch.object(table, "indexAt", return_value=table.model().index(row_index, 0)), \
                 patch("animusic.gui.anime_table.QMenu", return_value=menu), \
-                patch("animusic.gui.widgets.QMenu", return_value=menu):
+                patch("animusic.gui.widgets.QMenu", return_value=menu), \
+                patch("animusic.gui.theme_table.QMenu", return_value=menu):
             table.contextMenuEvent(event)
         return [a.text() for a in actions]
 
@@ -146,16 +147,14 @@ class TestAnimeControls(unittest.TestCase):
         self.assertEqual(len(self.page.all_rows()), 4)
         self.assertTrue(self.page.model.can_remove(self.page.model.rows[3]))
 
-    def test_second_step_keeps_existing_table_and_menu(self):
+    def test_second_step_uses_add_only_menu(self):
         page = ThemePage([dict(theme_id=1, anime_id=1, included=True, song_title="曲",
                                origin="manual", kind="OP", artists="人")], [])
         try:
-            self.assertIs(type(page.model), DictTableModel)
-            self.assertIs(type(page.table), DictTableView)
+            self.assertIs(type(page.model), ThemeTableModel)
+            self.assertIs(type(page.table), ThemeTableView)
             texts = self.menu(page.table, 0)
-            self.assertIn("排除此行（保留历史）", texts)
-            self.assertIn("从结果中排除（不删除）", texts)
-            self.assertIn("恢复为数据源值", texts)
+            self.assertEqual(texts, ['新增一行'])
         finally:
             page.deleteLater()
             QApplication.sendPostedEvents(None, QEvent.DeferredDelete)
