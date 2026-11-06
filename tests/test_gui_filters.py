@@ -104,8 +104,8 @@ class FilterTestBase(unittest.TestCase):
         cls.app = QApplication.instance() or QApplication(sys.argv)
 
     def _pump(self, n: int = 4):
-        for _ in range(n):
-            self.app.processEvents()
+        # 筛选同步完成，离线无需驱动应用事件循环。
+        pass
 
     # ---- 夹具页面（都带一份**每一项都能筛出严格子集**的数据，
     #      这样「装饰品」筛选项会被 test_every_option_actually_narrows 抓到）

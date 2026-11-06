@@ -1674,6 +1674,8 @@ class MainWindow(QMainWindow):
         if self._closing or (self.worker is not None and self.worker.isRunning()):
             return
         i = max(0, min(len(self.pages) - 1, i))
+        if self.stack.currentIndex() == 2 and i != 2:
+            self.pages[2].discard_drafts()
         self.stack.setCurrentIndex(i)
         self.stepper.set_current(i)
         page = self.pages[i]

@@ -724,6 +724,8 @@ class MatchPage(BasePage):
             r["_checked"] = r["status"] in ("auto", "pending_review")
         self._shown_row: int | None = None   # 避免重复重建候选面板
         self.cand_items: list = []           # 当前候选卡片，用于原地更新选中态
+        self._drafts: dict[object, dict | None] = {}
+        self._candidate_row: dict | None = None
 
         split = QSplitter(Qt.Vertical)
 
@@ -731,14 +733,7 @@ class MatchPage(BasePage):
         self.table.selectionModel().selectionChanged.connect(self._on_select)
         split.addWidget(self.table)
 
-        # ---- 回退：**一条**历史栈，覆盖「点候选卡片」和「单元格编辑」两类动作
-        #
-        # 为什么需要它：候选卡片一击即定稿（`_pick` 直接写 confirmed + manual），
-        # 而 `confirmed` 正是进第④步推送集的通行证（`session._match_rows` 只放
-        # auto/confirmed 进去）。用户浏览候选时误点一下，那首歌就**既成事实**了 ——
-        # 没有二次确认，也没有退路。
-        # 更重的一层：`manual=True` 保存时会变成 `decided_by='human'`，
-        # 被 `learn_from_season` 学进 `config/aliases.yaml` → 误点会**永久教坏别名表**。
+        # 只给正式决定留撤销快照；浏览候选不产生人工确认或别名学习信号。
         self._history: list[dict] = []
         self._history_limit = 32
         #: 「改完之后请把这一行还给我」的暗号（见 `_after_filter`）
@@ -770,7 +765,8 @@ class MatchPage(BasePage):
         ch = QHBoxLayout()
         self.cand_title = QLabel("候选")
         self.cand_title.setObjectName("SectionTitle")
-        ch.addWidget(self.cand_title)
+        self.cand_title.setWordWrap(True)
+        ch.addWidget(self.cand_title, 1)
 
         # 「候选都不对」的归宿。原来没有任何入口 —— 用户只能挑一首错的凑合，
         # 或者把它永远留在「待审核」里。`DecisionStatus.SKIPPED` 在库里、映射表里、
@@ -784,14 +780,24 @@ class MatchPage(BasePage):
         ch.addWidget(b_skip)
         ch.addStretch()
 
+        self.confirm_pick_btn = _btn("确认选中歌曲", "primary")
+        self.confirm_pick_btn.setEnabled(False)
+        self.confirm_pick_btn.clicked.connect(self._confirm_pick)
+        ch.addWidget(self.confirm_pick_btn)
+
         self.manual_input = QLineEdit()
         self.manual_input.setPlaceholderText("粘贴网易云链接或歌曲 ID，如 https://music.163.com/song?id=1375305989")
         self.manual_input.setMinimumWidth(360)
-        ch.addWidget(self.manual_input)
+        manual_row = QHBoxLayout()
+        manual_row.addWidget(self.manual_input, 1)
         b_manual = _btn("手动指定", "primary")
         b_manual.clicked.connect(self._manual_pick)
-        ch.addWidget(b_manual)
+        manual_row.addWidget(b_manual)
         cl.addLayout(ch)
+        cl.addLayout(manual_row)
+        self.pick_hint = QLabel("点击候选进行选择，再次点击取消；确认后才采用。")
+        self.pick_hint.setWordWrap(True)
+        cl.addWidget(self.pick_hint)
 
         self.cand_scroll = QScrollArea()
         self.cand_scroll.setWidgetResizable(True)
@@ -843,6 +849,7 @@ class MatchPage(BasePage):
     def _on_select(self, *_):
         rows = self.table.selectionModel().selectedRows()
         if not rows:
+            self._show_candidates({}, force=True)
             return
         self._show_candidates(self.model.rows[rows[0].row()])
 
@@ -852,6 +859,8 @@ class MatchPage(BasePage):
         if not force and rid == self._shown_row and self.cand_layout.count() > 1:
             return
         self._shown_row = rid
+        self._candidate_row = row or None
+        self._update_draft_ui()
 
         while self.cand_layout.count() > 1:
             it = self.cand_layout.takeAt(0)
@@ -897,8 +906,9 @@ class MatchPage(BasePage):
             self.cand_layout.insertWidget(0, hint)
             return
 
+        draft = self._draft_for(row)
         for c in cands:
-            item = CandidateItem(c, selected=(c["netease_song_id"] == row.get("chosen_id")))
+            item = CandidateItem(c, selected=bool(draft and str(c["netease_song_id"]) == str(draft["netease_song_id"])))
             item.picked.connect(lambda cd, r=row: self._pick(r, cd))
             self.cand_layout.insertWidget(self.cand_layout.count() - 1, item)
             self.cand_items.append(item)
@@ -919,27 +929,90 @@ class MatchPage(BasePage):
             it.set_selected(str(it.cand.get("netease_song_id")) == str(chosen_id))
 
     def _pick(self, row: dict, cand: dict) -> None:
-        # 重复点同一张卡片是真正的空操作 —— 不记历史，免得撤销栈被噪声塞满
-        # （误点一次要按好几下 Ctrl+Z 才能退回到误点**之前**）
-        if (str(row.get("chosen_id") or "") == str(cand["netease_song_id"])
-                and row.get("status") == "confirmed"):
-            self.log.emit(f"已是当前选中：{cand['name']}（未改动）")
+        if not self._is_live(row):
             return
-        self._snapshot([row], f"选定《{cand['name']}》")
+        draft = self._draft_for(row)
+        same = draft and str(draft['netease_song_id']) == str(cand['netease_song_id'])
+        self._drafts[self._draft_key(row)] = None if same else dict(cand)
+        self._update_draft_ui()
+        self.log.emit(f"{'取消暂选' if same else '暂选'}：{row['theme_title']} → {cand['name']}")
+
+    def _draft_key(self, row: dict):
+        # 少数原型/测试行没有theme_id；正式数据始终使用稳定的数据库ID。
+        return row.get('theme_id') if row.get('theme_id') is not None else id(row)
+
+    def _draft_for(self, row: dict) -> dict | None:
+        key = self._draft_key(row)
+        if key in self._drafts:
+            return self._drafts[key]
+        if row.get('status') not in ('auto', 'confirmed') or not row.get('chosen_id'):
+            return None
+        return next((c for c in row.get('candidates', [])
+                     if str(c['netease_song_id']) == str(row['chosen_id'])), {
+            'netease_song_id': row['chosen_id'], 'name': row.get('chosen_name') or '(手动指定)',
+            'artists': str(row.get('chosen_artists') or '').split('、'),
+            'score': row.get('score', 0), 'detail': row.get('detail'),
+            'duration_ms': row.get('chosen_duration'),
+        })
+
+    def _update_draft_ui(self) -> None:
+        row = self._candidate_row
+        draft = self._draft_for(row) if row and self._is_live(row) else None
+        self._sync_candidate_selection(str(draft['netease_song_id']) if draft else '')
+        self.confirm_pick_btn.setEnabled(bool(draft))
+        if draft:
+            adopted = (row.get('status') in ('auto', 'confirmed') and
+                       str(row.get('chosen_id')) == str(draft['netease_song_id']))
+            label = '当前已采用' if adopted else '待确认选择'
+            self.pick_hint.setText(f"{label}：{draft['name']}（ID {draft['netease_song_id']}）；点击确认后采用。")
+        elif row and row.get('status') in ('auto', 'confirmed') and row.get('chosen_id'):
+            self.pick_hint.setText('本次未选择；原已采用结果仍保留。否定原结果请跳过或清除匹配。')
+        else:
+            self.pick_hint.setText('点击候选进行选择，再次点击取消；确认后才采用。')
+
+    def discard_drafts(self) -> None:
+        if self._drafts:
+            self.log.emit('未确认的暂选未采用；保留原正式匹配结果')
+        self._drafts.clear()
+        self._update_draft_ui()
+
+    def _confirm_pick(self) -> None:
+        row = self._selected_row()
+        if row is None or not self._is_live(row):
+            return
+        cand = self._draft_for(row)
+        if not cand:
+            self._update_draft_ui()
+            return
+        if not cand.get('_manual_id'):
+            current = next((c for c in row.get('candidates', [])
+                            if str(c['netease_song_id']) == str(cand['netease_song_id'])), None)
+            if current is None and not (row.get('status') in ('auto', 'confirmed') and
+                                       str(row.get('chosen_id')) == str(cand['netease_song_id'])):
+                self._drafts[self._draft_key(row)] = None
+                self._update_draft_ui()
+                self.log.emit('暂选候选已失效，请重新选择')
+                return
+            cand = current or cand
+        if row.get('status') == 'confirmed' and str(row.get('chosen_id')) == str(cand['netease_song_id']):
+            self._drafts.pop(self._draft_key(row), None)
+            self._update_draft_ui()
+            self.log.emit(f"该歌曲已确认：{cand['name']}")
+            return
+        self._snapshot([row], f"确认《{cand['name']}》")
         row["chosen_name"] = cand["name"]
         row["chosen_artists"] = "、".join(cand.get("artists") or [])
         row["chosen_id"] = cand["netease_song_id"]
         row["score"] = cand.get("score", 0)
         row["detail"] = cand.get("detail")
+        row["chosen_duration"] = cand.get('duration_ms')
         row["status"] = "confirmed"
         row["status_label"] = "🔵 人工确认"
         row["manual"] = True
 
-        self._mark_row_changed(row)                       # 只刷这一行
-        self._sync_candidate_selection(cand["netease_song_id"])  # 只改选中态
-        self._refresh()
+        self._after_rows_changed([row], focus=False)
         self.log.emit(
-            f"人工选定：{row['theme_title']} → {cand['name']} / {'、'.join(cand.get('artists') or [])}"
+            f"已确认歌曲：{row['theme_title']} → {cand['name']} / {'、'.join(cand.get('artists') or [])}"
         )
 
     def _manual_pick(self) -> None:
@@ -959,17 +1032,17 @@ class MatchPage(BasePage):
             self.log.emit(f"无法从 {text[:50]!r} 解析出歌曲 ID")
             return
         r = self.model.rows[rows[0].row()]
-        self._snapshot([r], f"手动指定 ID {song_id}")
-        r["chosen_id"] = song_id
-        r["chosen_name"] = r.get("chosen_name") or "(手动指定)"
-        r["status"] = "confirmed"
-        r["status_label"] = "🔵 人工指定"
-        r["manual"] = True
-        self._mark_row_changed(r)
-        self._sync_candidate_selection(song_id)
-        self.log.emit(f"人工指定网易云 ID {song_id} → {r['anime']} {r['kind']}")
+        if not song_id.strip('0'):
+            self.log.emit('歌曲 ID 必须为正整数')
+            return
+        cand = next((c for c in r.get('candidates', []) if str(c['netease_song_id']) == song_id), None)
+        self._drafts[self._draft_key(r)] = dict(cand) if cand else {
+            'netease_song_id': song_id, 'name': f'(手动指定 ID {song_id}，详情待获取)',
+            'artists': [], 'score': 0, 'detail': None, '_manual_id': True,
+        }
+        self._update_draft_ui()
+        self.log.emit(f"暂选网易云 ID {song_id}，请点击「确认选中歌曲」")
         self.manual_input.clear()
-        self._refresh()
 
     # ---- 批量
     def _accept_all(self) -> None:
@@ -993,10 +1066,10 @@ class MatchPage(BasePage):
                 self.model.index(0, 0),
                 self.model.index(self.model.rowCount() - 1, self.model.columnCount() - 1),
             )
-        self.log.emit(f"已采用 {n} 条自动结果（全量）")
+        self.log.emit(f"已采用 {n} 条原自动／推荐结果（全量，不采用人工暂选）")
         # 采用完要重算视图：在「需要处理」下这批行已经处理掉了，
         # 让它们留在屏幕上会让人以为还没处理
-        self._apply_filter(self._view, log=False)
+        self._after_rows_changed(todo, focus=False)
 
     # ---- 回退：撤销 / 清除匹配 / 跳过此曲
 
@@ -1096,9 +1169,10 @@ class MatchPage(BasePage):
         **要把这一行还到眼前**（`_pending_focus`），否则用户看不出撤销生效没有。
         """
         for r in rows:
+            self._drafts.pop(self._draft_key(r), None)
             self._mark_row_changed(r)
             if id(r) == self._shown_row:
-                self._sync_candidate_selection(str(r.get("chosen_id") or ""))
+                self._update_draft_ui()
         self._pending_focus = rows[0] if (focus and rows) else None
         self._apply_filter(self._view, log=False)
         self._pending_focus = None
@@ -1199,6 +1273,7 @@ class MatchPage(BasePage):
         更早的误点用右键「清除此行的匹配」纠正。
         """
         self._history.clear()
+        self._drafts.clear()
         super().set_data(rows)
         self._update_undo_button()
 

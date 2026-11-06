@@ -661,6 +661,20 @@ class CoverLoader(QWidget):
 
 # ==================================================================== 候选卡片
 
+class _CandidateCheckBox(QCheckBox):
+    def mouseDoubleClickEvent(self, event):  # noqa: N802
+        self._ignore_release = True
+        event.accept()
+
+    def mouseReleaseEvent(self, event):  # noqa: N802
+        if getattr(self, '_ignore_release', False):
+            self._ignore_release = False
+            self.setDown(False)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+
 class CandidateItem(QFrame):
     """一条候选：封面 / 曲名 / 艺人 / 专辑 / 时长 / 标签 / 番剧标注 / 分数。"""
 
@@ -683,7 +697,7 @@ class CandidateItem(QFrame):
 
         top = QHBoxLayout()
         top.setSpacing(6)
-        self.radio = QCheckBox()
+        self.radio = _CandidateCheckBox()
         self.radio.setChecked(selected)
         self.radio.clicked.connect(lambda: self.picked.emit(self.cand))
         top.addWidget(self.radio)
@@ -758,8 +772,17 @@ class CandidateItem(QFrame):
             self.style().polish(self)
             self.update()
 
-    def mouseDoubleClickEvent(self, e):  # noqa: N802
-        self.picked.emit(self.cand)
+    def mouseReleaseEvent(self, event):  # noqa: N802
+        if getattr(self, '_ignore_release', False):
+            self._ignore_release = False
+        elif event.button() == Qt.LeftButton:
+            self.picked.emit(self.cand)
+        event.accept()
+
+    def mouseDoubleClickEvent(self, event):  # noqa: N802
+        # Qt已为双击发送过第一次release；第二次不能再把暂选切回去。
+        self._ignore_release = True
+        event.accept()
 
 
 # ==================================================================== 日志
