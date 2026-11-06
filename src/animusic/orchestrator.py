@@ -24,7 +24,7 @@ from typing import Callable
 from . import constants, scorer
 from .collector.base import SearchCollector
 from .config import Config
-from .http import RateLimited, RequestStats, brief_url
+from .http import RateLimited, RequestStats, brief_url, safe_diagnostic
 from .models import (
     Anime,
     Candidate,
@@ -364,7 +364,8 @@ class Orchestrator:
         if search is None:
             from .collector.api_search import ApiSearchCollector
 
-            search = ApiSearchCollector()
+            search = ApiSearchCollector(progress=self._note_search_http,
+                                        check_cancelled=self._check_cancelled)
         self.search = search
 
         #: 三个外部数据源的超时/重试从配置来（默认已比 `HTTP_TIMEOUT` 短得多，
@@ -424,6 +425,9 @@ class Orchestrator:
         慢和失败才是「时间去哪了」的答案，所以只报这两类。
         """
         self.progress(f"    · {msg}")
+
+    def _note_search_http(self, msg: str) -> None:
+        self.progress(f"    [{getattr(self, '_search_context', '准备')}] {safe_diagnostic(msg, 600)}")
 
     # ---- 「本步时间花在哪」
 
@@ -1012,6 +1016,25 @@ class Orchestrator:
     # ================================================================ 匹配
 
     def match_season(self, season: Season, retry_missing: bool = False) -> MatchReport:
+        started = time.monotonic()
+        self._search_errors = 0
+        self.progress("正在准备网易云匹配：读取曲目与已有决策")
+        try:
+            result = self._match_season(season, retry_missing)
+        except OperationCancelled:
+            self.progress(f"匹配已取消；总耗时 {time.monotonic() - started:.2f}s，已保存结果保留")
+            raise
+        except Exception as exc:
+            self.progress(f"匹配异常终止；总耗时 {time.monotonic() - started:.2f}s；"
+                          f"{type(exc).__name__}: {safe_diagnostic(exc)}")
+            raise
+        finally:
+            self._search_context = "准备"
+        self.progress(f"匹配{'存在搜索失败' if self._search_errors else '正常完成'}；"
+                      f"失败查询 {self._search_errors}；总耗时 {time.monotonic() - started:.2f}s")
+        return result
+
+    def _match_season(self, season: Season, retry_missing: bool = False) -> MatchReport:
         rep = MatchReport(season=season)
         sid = self.store.get_season_id(season.year, season.quarter)
         themes = self.store.theme_list(sid)
@@ -1024,11 +1047,31 @@ class Orchestrator:
             self.progress(f"增量重试模式：{len(todo)} 条 missing_* 待重试")
         else:
             todo = [t for t in themes if t["id"] not in decisions]
-            self.progress(f"待匹配 {len(todo)} / 共 {len(themes)} 条 theme")
+            self.progress(f"待匹配 {len(todo)} / 共 {len(themes)} 条 theme；"
+                          f"跳过已有决策 {sum(t['id'] in decisions for t in themes)} 条")
 
-        for row in todo:
+        if not todo:
+            self.progress("没有待处理曲目：当前范围为空或均已有决策")
+            return rep
+        # 先标未完成，取消或异常退出也不会沿用旧的已确认状态。
+        self.store.set_stage(sid, Stage.MATCH, StageStatus.DIRTY)
+        for index, row in enumerate(todo, 1):
             self._check_cancelled()
-            self._match_one(row, sid, rep)
+            self._search_context = f"曲目{index}"
+            started = time.monotonic()
+            self.progress(f"[{self._search_context}] 开始 {index}/{len(todo)}："
+                          f"{row['anime_cn'] or row['anime_jp']} {row['kind']} — {row['song_title']}")
+            try:
+                self._match_one(row, sid, rep)
+            except OperationCancelled:
+                self.progress(f"[曲目{index}] 已取消；耗时 {time.monotonic() - started:.2f}s")
+                raise
+            except Exception:
+                self.progress(f"[曲目{index}] 异常终止；耗时 {time.monotonic() - started:.2f}s")
+                raise
+            decision = self.store.decision_map(sid).get(row['id'])
+            self.progress(f"[曲目{index}] 结束：{decision['status'] if decision else '搜索失败，未决策'}；"
+                          f"耗时 {time.monotonic() - started:.2f}s")
 
         # 旧实现把全季度历史结果除以本次 searched，增量运行可能超过100%。
         # 从实际落库结果按本次范围计数；搜索全失败时旧 missing 决策仍在，不能算本次结果。
@@ -1047,7 +1090,9 @@ class Orchestrator:
         rep.missing_netease = summary.get(DecisionStatus.MISSING_NETEASE, 0)
         rep.missing_match = summary.get(DecisionStatus.MISSING_MATCH, 0)
 
-        self.store.set_stage(sid, Stage.MATCH, StageStatus.CONFIRMED, confirmed=True)
+        self._check_cancelled()
+        if not self._search_errors:
+            self.store.set_stage(sid, Stage.MATCH, StageStatus.CONFIRMED, confirmed=True)
         self.progress(
             f"本次完成：自动 {rep.auto} · 待审核 {rep.pending_review} · "
             f"未收录 {rep.missing_source} · 未上架 {rep.missing_netease} · "
@@ -1086,14 +1131,28 @@ class Orchestrator:
         search_ok = 0
         search_failed = 0
 
-        for q, why in zip(plan.queries, plan.reasons):
+        context = getattr(self, '_search_context', f"曲目{theme_id}")
+        for query_index, (q, why) in enumerate(zip(plan.queries, plan.reasons), 1):
             self._check_cancelled()
+            self._search_context = f"{context}/查询{query_index}"
+            started = time.monotonic()
+            self.progress(f"    [{self._search_context}] 搜索开始 {query_index}/{len(plan.queries)}："
+                          f"{safe_diagnostic(q)!r}（{why}）")
             try:
                 cands = self.search.search(q, limit=self.config.match.search_limit)
+                self._check_cancelled()
+            except OperationCancelled:
+                self.progress(f"    [{self._search_context}] 查询已取消；耗时 {time.monotonic() - started:.2f}s")
+                raise
             except Exception as e:  # noqa: BLE001
                 search_failed += 1
-                self.progress(f"    ! 搜索失败 {q!r}: {e}")
+                self._search_errors = getattr(self, '_search_errors', 0) + 1
+                category = getattr(e, 'category', 'HTTP错误' if getattr(e, 'status', None) else '网络或搜索错误')
+                self.progress(f"    [{self._search_context}] ! 搜索失败 {safe_diagnostic(q)!r}: "
+                              f"{category}；{safe_diagnostic(e)}；耗时 {time.monotonic() - started:.2f}s")
                 continue
+            self.progress(f"    [{self._search_context}] 搜索结束：{'正常候选' if cands else '空结果'} "
+                          f"{len(cands)} 条；总耗时 {time.monotonic() - started:.2f}s")
             search_ok += 1
             rep.queries_used += 1
             if not cands:

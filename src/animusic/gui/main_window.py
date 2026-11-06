@@ -1326,6 +1326,8 @@ class MainWindow(QMainWindow):
             self.btn_stop.setEnabled(False)
             self.pages[1].btn_stop.setEnabled(False)
             message = ('正在停止，已完成结果将保留' if getattr(self.worker, '_theme_fetch', False)
+                       else '已请求停止，等待当前网络调用返回，随后停止后续搜索'
+                       if getattr(self.worker, '_search_match', False)
                        else '已请求停止，正在等待当前操作完成回查与记账')
             self.status.showMessage(message)
             self.log(message)
@@ -1444,9 +1446,13 @@ class MainWindow(QMainWindow):
         season = sess.season
 
         def job(progress=None, should_stop=None):
+            if progress is not None:
+                progress('匹配后台任务已进入，正在准备搜索服务')
             return sess.run_operation('match_season', season, progress=progress, should_stop=should_stop)
 
         self._run_task(job, f"匹配 {season.key}")
+        if self.worker is not None and self.worker.label == f"匹配 {season.key}":
+            self.worker._search_match = True
 
     # ---- 推送（唯一会改动账号的动作）
 

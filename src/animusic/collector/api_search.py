@@ -23,18 +23,30 @@ from __future__ import annotations
 import urllib.parse
 
 from .. import constants
-from ..http import HttpClient
+from ..http import HttpClient, safe_diagnostic
 from ..models import Candidate, HealthStatus, Origin
 
 _MAX_LIMIT = 30
 
 
+class SearchError(RuntimeError):
+    def __init__(self, category: str, message: str, *, http_status=None, code=None):
+        self.category = category
+        self.http_status = http_status
+        self.code = code
+        super().__init__(f"{category}：HTTP {http_status}；code={code}；{safe_diagnostic(message)}")
+
+
 class ApiSearchCollector:
-    def __init__(self, client: HttpClient | None = None):
+    def __init__(self, client: HttpClient | None = None, *, progress=None, check_cancelled=None):
         self.http = client or HttpClient(
             user_agent=constants.NETEASE_HEADERS["User-Agent"],
             rps=constants.SEARCH_RATE_RPS,
+            on_event=progress,
+            diagnostics=progress is not None,
         )
+        if check_cancelled is not None:
+            self.http.check_cancelled = check_cancelled
 
     # ---------------------------------------------------------------- 健康
 
@@ -59,20 +71,33 @@ class ApiSearchCollector:
             f"?s={urllib.parse.quote(kw)}"
             f"&type=1&offset=0&total=true&limit={limit}"
         )
-        data = self.http.get_json(
+        response = self.http.get(
             url,
             headers={
                 "Referer": constants.NETEASE_HEADERS["Referer"],
                 "Accept": constants.NETEASE_HEADERS["Accept"],
             },
         )
-        if data.get("code") != 200:
-            raise RuntimeError(f"网易云搜索返回 code={data.get('code')}")
+        try:
+            data = response.json()
+        except (ValueError, LookupError):
+            raise SearchError("解析错误", "响应不是有效JSON", http_status=response.status) from None
+        if not isinstance(data, dict):
+            raise SearchError("解析错误", "响应根节点不是对象", http_status=response.status)
+        code = data.get("code")
+        if code != 200:
+            raise SearchError("服务拒绝" if code is not None else "响应结构错误",
+                              data.get("message") or data.get("msg") or "无服务端说明",
+                              http_status=response.status, code=code)
 
-        songs = ((data.get("result") or {}).get("songs")) or []
-        out: list[Candidate] = []
-        for rank, s in enumerate(songs):
-            out.append(self._to_candidate(s, keyword=kw, rank=rank))
+        try:
+            songs = ((data.get("result") or {}).get("songs")) or []
+            if not isinstance(songs, list):
+                raise ValueError("songs不是数组")
+            out = [self._to_candidate(s, keyword=kw, rank=rank) for rank, s in enumerate(songs)]
+        except (AttributeError, TypeError, ValueError):
+            raise SearchError("解析错误", "候选字段格式异常", http_status=response.status, code=code) from None
+        self.http._emit(f"搜索响应：HTTP {response.status}；code={code}；候选 {len(out)}")
         return out
 
     # ---------------------------------------------------------------- 解析

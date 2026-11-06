@@ -27,6 +27,7 @@ import hashlib
 import json
 import os
 import random
+import re
 import ssl
 import threading
 import time
@@ -34,11 +35,28 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
+from contextlib import contextmanager
 from typing import Any, Callable
 
 from . import constants
 
 _CTX = ssl.create_default_context()
+
+
+def safe_diagnostic(value: object, limit: int = 240) -> str:
+    """服务端消息和异常可能夹带凭据；先脱敏再截断。"""
+    text = " ".join(str(value).split())
+    text = re.sub(r"https?://[^\s<>]+", "[URL已隐藏]", text, flags=re.I)
+    text = re.sub(
+        r"\b(cookie|set-cookie|authorization)\b[\"']?\s*[:=].*",
+        r"\1=[已隐藏]", text, flags=re.I,
+    )
+    text = re.sub(
+        r"\b([\w-]*(?:token|secret|password|csrf|music_u)[\w-]*)\b[\"']?\s*[:=]\s*[^\s,;]+",
+        r"\1=[已隐藏]", text, flags=re.I,
+    )
+    text = re.sub(r"\bBearer\s+[^\s,;]+", "Bearer [已隐藏]", text, flags=re.I)
+    return text[:limit]
 
 
 class HttpError(RuntimeError):
@@ -230,7 +248,7 @@ class RateLimiter:
         self._last: dict[str, float] = {}
         self._lock = threading.Lock()
 
-    def wait(self, key: str) -> float:
+    def wait(self, key: str, *, wait=None) -> float:
         """必要时睡到下一个允许的时刻，返回**实际睡了多少秒**。
 
         为什么要返回这个数：真机那次「本步用时 163.0 秒」里，
@@ -246,7 +264,7 @@ class RateLimiter:
             slept = 0.0
             if now < earliest:
                 slept = earliest - now
-                time.sleep(slept)
+                (wait or time.sleep)(slept)
                 now = time.monotonic()
             self._last[key] = now
             return slept
@@ -336,6 +354,7 @@ class HttpClient:
         rate_limit_wait_budget: float = constants.RATE_LIMIT_WAIT_BUDGET,
         rate_limit_retries: int = constants.RATE_LIMIT_RETRIES,
         rate_limit_breaker: int = constants.RATE_LIMIT_BREAKER,
+        diagnostics: bool = False,
     ):
         self.user_agent = user_agent
         self.timeout = timeout
@@ -348,6 +367,8 @@ class HttpClient:
         #: 自己取快照差值，或者直接用一个新的客户端（编排层是后者）。
         self.stats = RequestStats()
         self._on_event = on_event
+        self.diagnostics = diagnostics
+        self.wait_notice_interval = 10.0
         self.check_cancelled = None
         # 立即持久化等待期限：即使用户在自动等待中取消，重启也不能绕过它。
         self.on_rate_limit = None
@@ -404,10 +425,30 @@ class HttpClient:
         """
         if self._on_event is None:
             return
+        if self.diagnostics:
+            msg = safe_diagnostic(msg, limit=600)
         try:
             self._on_event(msg)
         except Exception:  # noqa: BLE001
             pass
+
+    @contextmanager
+    def _watch_attempt(self, started: float):
+        # 仅诊断模式启用；网络调用返回后同步收回线程，避免终止后继续报等待。
+        done = threading.Event()
+        def report():
+            while not done.wait(self.wait_notice_interval):
+                self._emit(f"当前网络调用已等待 {time.monotonic() - started:.1f}s（尚未返回）")
+        watcher = None
+        if self.diagnostics:
+            watcher = threading.Thread(target=report, name="search-wait-notice", daemon=True)
+            watcher.start()
+        try:
+            yield
+        finally:
+            done.set()
+            if watcher is not None:
+                watcher.join()
 
     def _note_attempt(self, url: str, dt: float, err: str | None,
                       attempt: int, attempts: int) -> None:
@@ -440,6 +481,18 @@ class HttpClient:
             time.sleep(step)
             remaining -= step
         self.check_cancelled()
+
+    def _accounted_wait(self, seconds: float, field: str) -> None:
+        if not self.diagnostics:
+            setattr(self.stats, field, getattr(self.stats, field) + seconds)
+            self._wait_retry(seconds)
+            return
+        started = time.monotonic()
+        try:
+            self._wait_retry(seconds)
+        finally:
+            # 取消只记已经等待的时间，不能把原计划等待全算进去。
+            setattr(self.stats, field, getattr(self.stats, field) + time.monotonic() - started)
 
     def request(
         self,
@@ -502,7 +555,18 @@ class HttpClient:
         i = 0
         retry_kind = None
         while True:
-            self.stats.limiter_seconds += self.limiter.wait(host)
+            if self.check_cancelled is None and not self.diagnostics:
+                self.stats.limiter_seconds += self.limiter.wait(host)
+            else:
+                def limit_wait(seconds):
+                    if self.diagnostics:
+                        self._emit(f"限速等待 {seconds:.2f}s")
+                        self._accounted_wait(seconds, 'limiter_seconds')
+                    else:
+                        self._wait_retry(seconds)
+                slept = self.limiter.wait(host, wait=limit_wait)
+                if not self.diagnostics:
+                    self.stats.limiter_seconds += slept
             if self.check_cancelled is not None:
                 self.check_cancelled()
             # 等待完成且真正开始下一次发送时才计重试，不能把「准备重试」当作请求。
@@ -512,9 +576,12 @@ class HttpClient:
                 self.stats.retried += 1
             self.stats.requests += 1
             t0 = time.monotonic()
+            if self.diagnostics:
+                self._emit(f"HTTP尝试 {self.stats.requests} 开始：{host.split('@')[-1]}"
+                           f"{urllib.parse.urlparse(url).path}；超时配置 {timeout or self.timeout:g}s")
             req = urllib.request.Request(url, data=data, headers=h, method=method)
             try:
-                with urllib.request.urlopen(
+                with self._watch_attempt(t0), urllib.request.urlopen(
                     req, timeout=timeout or self.timeout, context=_CTX
                 ) as r:
                     raw = r.read()
@@ -525,6 +592,11 @@ class HttpClient:
                         except OSError:
                             pass
                     self._note_attempt(url, time.monotonic() - t0, None, i, attempts)
+                    if self.diagnostics:
+                        self._emit(f"HTTP尝试 {self.stats.requests} 返回 HTTP {r.status}；"
+                                   f"网络耗时 {time.monotonic() - t0:.2f}s")
+                    if self.check_cancelled is not None:
+                        self.check_cancelled()
                     self._clear_429(host)
                     resp = Response(r.status, raw, hdrs, url)
                     if use_cache:
@@ -545,11 +617,17 @@ class HttpClient:
 
             except urllib.error.HTTPError as e:
                 body = b""
-                try:
-                    body = e.read()
-                except Exception:
-                    pass
+                if self.diagnostics:
+                    # 搜索诊断不使用错误正文；不再等待一个无用且可能阻塞的read。
+                    e.close()
+                else:
+                    try:
+                        body = e.read()
+                    except Exception:
+                        pass
                 dt = time.monotonic() - t0
+                if self.diagnostics:
+                    self._emit(f"HTTP尝试 {self.stats.requests} 返回 HTTP {e.code}；网络耗时 {dt:.2f}s")
 
                 # ---- 429：按**服务端说的**办，不走那套拍脑袋的指数退避
                 if e.code == 429:
@@ -560,6 +638,9 @@ class HttpClient:
                         self.on_rate_limit(time.time() + wait)
                     self._note_attempt(url, dt, "HTTP 429（限流，不是网络故障）",
                                        i, attempts)
+                    # 先保留服务端等待期限，取消不能绕过下一轮的冷却要求。
+                    if self.check_cancelled is not None:
+                        self.check_cancelled()
                     # ⚠️ 重试**不计入**「连续限流」的计数。这是第一版写错的地方：
                     # 那次把「同一个 URL 的限流重试」也算成新的一次，于是
                     # **越老实按服务端要求重试，熔断触发得越快** —— 完全反了。
@@ -570,14 +651,13 @@ class HttpClient:
                     if rl_used < self.rate_limit_retries \
                             and host not in self._rl_tripped and nap <= left:
                         rl_used += 1
-                        self.stats.rate_limit_wait += nap
                         asked = (f"服务端 Retry-After={wait:.0f} 秒"
                                  if wait is not None else "服务端没给 Retry-After")
                         self._emit(f"被限流（{asked}）—— 等 {nap:.1f} 秒后重试"
                                    f"（本 URL 最多为限流重试 "
                                    f"{self.rate_limit_retries} 次；本步剩余预算 "
                                    f"{left - nap:.1f} 秒）")
-                        self._wait_retry(nap)
+                        self._accounted_wait(nap, 'rate_limit_wait')
                         retry_kind = "rate_limit"
                         continue
                     if nap > left and not self._rl_budget_spent:
@@ -600,6 +680,8 @@ class HttpClient:
                     f"HTTP {e.code} {e.reason} for {url}", status=e.code, url=url
                 )
                 self._note_attempt(url, dt, f"HTTP {e.code} {e.reason}", i, attempts)
+                if self.check_cancelled is not None:
+                    self.check_cancelled()
                 # 4xx 除了 429 都不重试
                 if e.code < 500:
                     self.stats.failed += 1
@@ -608,12 +690,15 @@ class HttpClient:
                 last = e
                 self._note_attempt(url, time.monotonic() - t0,
                                    f"{type(e).__name__}: {e}", i, attempts)
+                if self.check_cancelled is not None:
+                    self.check_cancelled()
 
             if i < attempts:
                 # 指数退避 + 抖动（只管网络抖动与 5xx；429 在上面单独处理）
                 nap = min(8.0, (2.0**i) * 0.5) * (0.7 + random.random() * 0.6)
-                self.stats.backoff += nap
-                self._wait_retry(nap)
+                if self.diagnostics:
+                    self._emit(f"网络错误或5xx，退避 {nap:.2f}s 后重试（网络重试 {i + 1}/{attempts}）")
+                self._accounted_wait(nap, 'backoff')
                 i += 1
                 retry_kind = "network"
                 continue
