@@ -1,4 +1,4 @@
-"""Bangumi「在看」列表读取。
+"""Bangumi「在看」列表及当季日本 TV 分类列表读取。
 
 对应 DESIGN.md §5.3，选择器与路径均已实测确认（附录 F）。
 
@@ -17,8 +17,10 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from dataclasses import dataclass
 from datetime import date
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from .. import constants
 from ..models import BangumiSubject, Season, SeasonBucket
@@ -60,6 +62,41 @@ DOM_EXTRACT_JS = """
   return JSON.stringify(out);
 })()
 """
+
+# 分类浏览与收藏页的名称结构相似，但没有 small 时主链接就是原名。
+# 结构和筛选同时校验，登录页/验证页不能冒充正常空列表。
+SEASON_EXTRACT_JS = r"""
+(() => {
+  const list = document.querySelector('#browserItemList');
+  const sidebar = document.querySelector('#columnSubjectBrowserB');
+  const selected = sidebar ? Array.from(sidebar.querySelectorAll('a.focus'))
+      .map(a => a.textContent.trim()) : [];
+  const rows = list ? Array.from(list.querySelectorAll('li.item')).map(li => {
+    const a = li.querySelector('h3 a[href*="/subject/"]');
+    const small = li.querySelector('h3 small');
+    const name = a ? a.textContent.trim() : '';
+    const original = small ? small.textContent.trim() : '';
+    const id = a && new URL(a.href, location.href).pathname.match(/^\/subject\/(\d+)$/);
+    const info = li.querySelector('p.info');
+    return {bgm_id: id ? Number(id[1]) : 0,
+      title_cn: original ? name : null, title_jp: original || name,
+      info: info ? info.textContent.trim() : '',
+      url: a ? a.href : ''};
+  }) : [];
+  const current = document.querySelector('.page_inner .p_cur');
+  const currentPage = current ? Number(current.textContent.trim()) : null;
+  const requestedPage = Number(new URL(location.href).searchParams.get('page') || 1);
+  const hasNext = Array.from(document.querySelectorAll('.page_inner a[href]')).some(a => {
+    const u = new URL(a.href, location.href);
+    return u.pathname === location.pathname && Number(u.searchParams.get('page')) > requestedPage;
+  });
+  return JSON.stringify({url: location.href,
+    valid: !!list && !!sidebar && selected.includes('TV') && selected.includes('日本'),
+    current_page: currentPage, has_next: hasNext, rows});
+})()
+"""
+
+SEASON_MAX_PAGES = 100  # 异常保护，不采用网站显示的11页作为结果边界。
 
 
 @dataclass
@@ -107,6 +144,112 @@ class BangumiSource:
         return found
 
     # ---------------------------------------------------------------- 入口
+
+    @staticmethod
+    def season_browser_url(year: int, month: int, page: int = 1, *, host: str = 'bgm.tv') -> str:
+        return (f"https://{host}/anime/browser/tv/{quote('日本')}/airtime/{year}-{month}"
+                f"?sort=title&page={page}")
+
+    @staticmethod
+    def _season_page(payload: str, year: int, month: int, page_no: int) -> dict:
+        try:
+            data = json.loads(payload)
+            if not isinstance(data, dict) or data.get('valid') is not True:
+                raise ValueError('不是有效的 TV／日本分类列表（可能需要登录或通过站点验证）')
+            url = urlsplit(data['url'])
+            expected = f'/anime/browser/tv/日本/airtime/{year}-{month}'
+            if (url.scheme != 'https' or url.hostname not in ('bgm.tv', 'bangumi.tv')
+                    or unquote(url.path).rstrip('/') != expected
+                    or parse_qs(url.query).get('page', ['1']) != [str(page_no)]):
+                raise ValueError('未到达指定月份或页码')
+            if data.get('current_page') not in (None, page_no):
+                raise ValueError('分页回退，无法确认番单完整性')
+            if not isinstance(data.get('rows'), list) or not isinstance(data.get('has_next'), bool):
+                raise ValueError('列表结构不符')
+            return data
+        except (ValueError, TypeError, KeyError) as exc:
+            raise BangumiReadError(f'{year}-{month} 第{page_no}页读取失败：{exc}') from exc
+
+    @staticmethod
+    def _season_subject(row: dict, year: int, month: int) -> BangumiSubject:
+        try:
+            if not isinstance(row, dict):
+                raise ValueError('条目结构不符')
+            subject = BangumiSource._to_subject_dom(row)
+            if subject.bgm_id <= 0 or not subject.all_names():
+                raise ValueError('条目缺少有效 ID 或名称')
+            # 只读首播信息起始处，避免把后面的制作信息中的日期当成首播日。
+            match = re.match(r'^(?:\d+话\s*/\s*)?(\d{4})(?:年|[-/.])?'
+                             r'(?:(\d{1,2})(?:月|[-/.])?(?:(\d{1,2})日?)?)?',
+                             (row.get('info') or '').strip())
+            if match:
+                y, m, d = match.groups()
+                if int(y) != year or (m and int(m) != month):
+                    raise ValueError(f'条目 {subject.bgm_id} 的首播年月与筛选条件不符')
+                if m and d:
+                    subject.air_date = date(int(y), int(m), int(d))
+            return subject
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise BangumiReadError(f'{year}-{month} 番剧条目异常：{exc}') from exc
+
+    def read_season_all(self, season: Season, *, check_cancelled=None, progress=None) -> ReadResult:
+        """三个首播月份全部读完才返回；个人在看读取不经过此路径。"""
+        check = check_cancelled or (lambda: None)
+        report = progress or (lambda message: None)
+        subjects: dict[int, BangumiSubject] = {}
+        check()
+        # 地区筛选需要登录；沿用已有标签页域名，避免切换站点丢失登录态。
+        existing_tab = self.bridge.find_bangumi_tab()
+        existing_url = getattr(existing_tab, 'url', '')
+        host = urlsplit(existing_url).hostname if isinstance(existing_url, str) else None
+        host = host if host in ('bgm.tv', 'bangumi.tv') else 'bgm.tv'
+        tab, page = self.bridge.open_tab_and_wait(
+            self.season_browser_url(season.year, season.start_month, host=host), timeout=25)
+        try:
+            for month in range(season.start_month, season.start_month + 3):
+                month_seen: set[int] = set()
+                for page_no in range(1, SEASON_MAX_PAGES + 1):
+                    check()
+                    if month != season.start_month or page_no != 1:
+                        time.sleep(0.3)
+                        check()
+                        if not self.bridge.navigate_and_wait(
+                                page, self.season_browser_url(season.year, month, page_no, host=host), timeout=25):
+                            raise BangumiReadError(f'{season.year}-{month} 第{page_no}页加载超时')
+                    check()
+                    report(f'读取 Bangumi {season.year}年{month}月 第{page_no}页…')
+                    data = self._season_page(self.bridge.eval_in_tab(tab, SEASON_EXTRACT_JS),
+                                             season.year, month, page_no)
+                    batch = [self._season_subject(row, season.year, month) for row in data['rows']]
+                    if not batch:
+                        break
+                    ids = {s.bgm_id for s in batch}
+                    if not ids - month_seen:
+                        raise BangumiReadError(f'{season.year}-{month} 第{page_no}页重复，无法确认番单完整性')
+                    month_seen.update(ids)
+                    for subject in batch:
+                        old = subjects.get(subject.bgm_id)
+                        if old is None:
+                            subjects[subject.bgm_id] = subject
+                        else:
+                            if old.title_jp and subject.title_jp and old.title_jp != subject.title_jp:
+                                raise BangumiReadError(f'条目 {subject.bgm_id} 原名冲突')
+                            if old.air_date and subject.air_date and old.air_date != subject.air_date:
+                                raise BangumiReadError(f'条目 {subject.bgm_id} 首播日期冲突')
+                            for field in ('title_cn', 'title_jp', 'air_date', 'url'):
+                                if not getattr(old, field):
+                                    setattr(old, field, getattr(subject, field))
+                    if not data['has_next']:
+                        break
+                else:
+                    raise BangumiReadError(f'{season.year}-{month} 达到{SEASON_MAX_PAGES}页保护上限')
+            check()
+            return ReadResult(list(subjects.values()), 'season_browser', f'{len(subjects)} 条')
+        finally:
+            try:
+                page.close()
+            finally:
+                self.bridge.close_tab(tab)
 
     def read_watching(self) -> ReadResult:
         errors: list[str] = []

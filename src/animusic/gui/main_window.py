@@ -1126,9 +1126,8 @@ class MainWindow(QMainWindow):
 
         anime.add_action("从 Bangumi 拉取「在看」", self._fetch_bangumi, "primary",
                          "读取已接管浏览器里的 Bangumi 在看列表", index=0)
-        all_anime = anime.add_action("当季全部（来源待定）", lambda: None, "normal",
-                                    "番单来源尚未确定，暂不可用", index=1)
-        all_anime.setEnabled(False)
+        anime.add_action("从 Bangumi 拉取当季全部", self._fetch_all_bangumi, "normal",
+                         "读取所选季度三个月首播的日本 TV 动画，需要浏览器登录 Bangumi", index=1)
 
         theme.add_action("匹配全部番剧曲名", self._fetch_themes, "primary",
                          "重新查询全部纳入番剧的维基动画歌曲，包括此前成功项目", index=0)
@@ -1354,14 +1353,14 @@ class MainWindow(QMainWindow):
 
         self._run_task(job, f"从 Bangumi 拉取 {season.key}")
 
-    def _fetch_animethemes(self) -> None:
+    def _fetch_all_bangumi(self) -> None:
         sess = self.session
         season = sess.season
 
         def job(progress=None, should_stop=None):
-            return sess.run_operation('fetch_season_from_animethemes', season, progress=progress, should_stop=should_stop)
+            return sess.run_operation('fetch_all_anime_list', season, progress=progress, should_stop=should_stop)
 
-        self._run_task(job, f"从 AnimeThemes 拉取 {season.key}")
+        self._run_task(job, f"从 Bangumi 拉取当季全部 {season.key}")
 
     def _update_season(self) -> None:
         """季度内增量重跑 —— 只处理新的与值得重试的。

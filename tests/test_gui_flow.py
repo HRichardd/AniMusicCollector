@@ -402,13 +402,19 @@ class TestGuiFlow(unittest.TestCase):
         self.assertNotIn("仅从 AnimeThemes 拉当季", texts)
         self.assertNotIn("增量重跑（周更）", texts)
         self.assertNotIn("排除补充的番", texts)
-        pending = next(b for b in buttons if b.text() == "当季全部（来源待定）")
-        self.assertFalse(pending.isEnabled())
+        all_anime = next(b for b in buttons if b.text() == "从 Bangumi 拉取当季全部")
+        self.assertTrue(all_anime.isEnabled())
         with patch.object(self.win, "_run_task") as task, patch.object(self.sess, "run_operation") as operation:
             buttons[0].click()
             task.assert_called_once()
             task.call_args.args[0]()
             self.assertEqual(operation.call_args.args[0], "fetch_anime_list")
+            task.reset_mock()
+            operation.reset_mock()
+            all_anime.click()
+            task.assert_called_once()
+            task.call_args.args[0]()
+            self.assertEqual(operation.call_args.args[0], "fetch_all_anime_list")
 
     def test_next_saves_anime_edits(self):
         self._seed()

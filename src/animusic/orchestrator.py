@@ -594,15 +594,22 @@ class Orchestrator:
 
     # ================================================================ 番单
 
-    def fetch_anime_list(self, season: Season) -> FetchReport:
+    def fetch_all_anime_list(self, season: Season) -> FetchReport:
+        return self.fetch_anime_list(season, all_anime=True)
+
+    def fetch_anime_list(self, season: Season, *, all_anime: bool = False) -> FetchReport:
         """向导第一步只确定番单，曲目查询必须由第二步显式启动。"""
         self._check_cancelled()
-        self.progress("读取 Bangumi「在看」列表（仅番单）…")
-        result = self.bangumi.read_watching()
+        self.progress("读取 Bangumi 当季全部番剧（仅番单）…" if all_anime
+                      else "读取 Bangumi「在看」列表（仅番单）…")
+        result = (self.bangumi.read_season_all(season, check_cancelled=self._check_cancelled,
+                                              progress=self.progress) if all_anime
+                  else self.bangumi.read_watching())
         self._check_cancelled()
-        picked = BangumiSource.filter_by_season(
-            result.subjects, season, self.config.bangumi.include_cross_season
-        )
+        # 分类页已经按首播月份筛选；缺少具体日的条目也属于目标季度。
+        picked = ([(s, SeasonBucket.TARGET) for s in result.subjects] if all_anime
+                  else BangumiSource.filter_by_season(
+                      result.subjects, season, self.config.bangumi.include_cross_season))
         sid = self.store.get_season_id(season.year, season.quarter)
         before = [dict(r) for r in self.store.anime_list(sid, only_included=False)]
         # 取消或保存出错时整体回滚，不能把半份新番单当作拉取完成。

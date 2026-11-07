@@ -40,6 +40,32 @@ class TestAnimeList(unittest.TestCase):
         for name in ("_at_pool", "_collect_themes", "_match_anime", "match_season"):
             getattr(self.orch, name).assert_not_called()
 
+    def test_all_source_saves_month_only_subject_without_watching_or_themes(self):
+        self.orch.bangumi.read_season_all.return_value = ReadResult([
+            BangumiSubject(9, '月内首播', '新作', None),
+        ], 'season_browser')
+        self.orch.config.bangumi.include_cross_season = False
+        rep = self.orch.fetch_all_anime_list(self.season)
+        self.orch.bangumi.read_watching.assert_not_called()
+        self.orch.bangumi.read_season_all.assert_called_once_with(
+            self.season, check_cancelled=self.orch._check_cancelled, progress=self.orch.progress)
+        self.assertEqual(rep.read_path, 'season_browser')
+        rows = self.store.anime_list(self.store.get_season_id(2026, 4))
+        self.assertEqual([r['bgm_id'] for r in rows], [9])
+        for name in ('_at_pool', '_collect_themes', '_match_anime', 'match_season'):
+            getattr(self.orch, name).assert_not_called()
+
+    def test_all_source_failure_leaves_existing_list_and_stage(self):
+        self.orch.fetch_anime_list(self.season)
+        sid = self.store.get_season_id(2026, 4)
+        before = [dict(r) for r in self.store.anime_list(sid)]
+        stage = self.store.get_stage(sid, Stage.ANIME)
+        self.orch.bangumi.read_season_all.side_effect = RuntimeError('月份读取失败')
+        with self.assertRaises(RuntimeError):
+            self.orch.fetch_all_anime_list(self.season)
+        self.assertEqual([dict(r) for r in self.store.anime_list(sid)], before)
+        self.assertEqual(self.store.get_stage(sid, Stage.ANIME), stage)
+
     def test_repeat_fetch_preserves_manual_edits_exclusion_and_note(self):
         sid = self.store.get_season_id(2026, 4)
         aid = self.store.upsert_anime(sid, Anime(
